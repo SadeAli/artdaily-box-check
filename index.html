@@ -54,7 +54,8 @@
         <div class="sketchbar">
           <span class="edge-count" id="edgeCount" aria-live="polite">edges: 0</span>
           <button class="btn btn-primary" id="btnCheck" disabled>check it ✓</button>
-          <button class="btn" id="btnClear">clear</button>
+          <button class="btn" id="btnUndo" disabled>undo <span aria-hidden="true">↶</span></button>
+          <button class="btn" id="btnClear" disabled>clear</button>
         </div>
         <div class="critique" id="critique" aria-live="polite" hidden></div>
       </div>
@@ -65,8 +66,9 @@
       </div>
       <div class="howto" id="howTo" hidden>
         <p class="howto-cmd" aria-hidden="true"><span class="prompt">$</span> man box-check</p>
-        <p>Freehand a 3D box, one straight stroke per edge — 6 edges minimum, a full box is 9–12 — then hit “check it”.</p>
-        <p>Each edge direction is scored on convergence: a tight vanishing point scores high, parallel is fine, diverging is the classic mistake.</p>
+        <p>Freehand a 3D box, one straight stroke per edge — 6 edges minimum, a full box is 9–12 — then hit “check it”. “Undo” takes back the last stroke; “clear” starts the box over without spending the round.</p>
+        <p>Your strokes are sorted into the three edge directions and each is scored on convergence: a tight vanishing point scores high, parallel is fine (85), diverging is the classic mistake (caps at 30).</p>
+        <p>After checking, tap any critique row to spotlight just that set on the sheet. The dashed ghost is the true box the maths fitted to your best two vanishing points — the shape you were reaching for.</p>
         <p>Studio tip: check yourself the way Drawabox does — extend every line after you draw it. Converging slightly beats parallel; diverging is never right.</p>
       </div>
 

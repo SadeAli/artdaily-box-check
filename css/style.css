@@ -413,10 +413,34 @@ a { color: inherit; }
   font-size: 0.83rem;
   font-weight: 600;
 }
-.crit-row { margin: 4px 0; }
+/* each row is a button: press it to spotlight that set on the sheet */
+.crit-row {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  margin: 2px 0;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 4px 9px 5px 8px;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+button.crit-row:hover { border-color: var(--line); background: color-mix(in srgb, var(--line) 14%, transparent); }
+button.crit-row:focus-visible { outline: 2px solid var(--game-accent); outline-offset: 2px; }
+.crit-row.is-lit {
+  border-color: color-mix(in srgb, var(--game-accent) 55%, var(--line));
+  background: color-mix(in srgb, var(--game-accent) 12%, transparent);
+}
 .crit-axis { color: var(--ink); font-weight: 800; }
-.crit-note { color: var(--muted); }
+.crit-note { color: var(--muted); cursor: default; font-style: italic; }
 .crit-score { color: var(--muted); font-weight: 700; }
+
+/* the shared .btn has no height floor of its own — give this game's
+   controls a comfortable thumb target */
+.sketchbar .btn, .game-controls .btn { min-height: 44px; }
 
 /* verdict inks, checked against both themes: mixed toward graphite
    on paper for AA, pure watercolor on the night-studio sheet */

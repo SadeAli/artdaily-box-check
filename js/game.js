@@ -2,8 +2,17 @@
    game.js — Box Check: the 250 Box Challenge with a feedback
    loop. Freehand a box one stroke per edge; each stroke is
    reduced to its dominant line (total-least-squares fit), the
-   lines are clustered into 3 direction families, and each family
-   is judged on how honestly it converges to a vanishing point.
+   lines are sorted into 3 direction families by the VANISHING
+   POINT they share, and each family is judged on how honestly
+   it converges to it. The three families are then held to the
+   one thing a real box cannot fake: they must admit a real
+   pinhole camera, whose principal point and focal length are
+   read off the drawing as the orthocenter of the VP triangle.
+
+   Grouping is by VP and not by image angle on purpose — a single
+   3D direction fans across 40°+ of image angle under ordinary
+   perspective, so angle clustering cannot separate the axes.
+
    All scoring math lives in the PURE section — inputs in,
    0–100 out — so it stays unit-testable without a canvas.
    ============================================================ */
@@ -14,7 +23,15 @@
   var MIN_EDGES = 6;      /* "check it" unlocks here; a full box is 9–12 */
   var MAX_EDGES = 36;
   var MIN_STROKE = 30;    /* px — shorter strokes are ignored */
-  var MERGE_DEG = 10;     /* families closer than this are one direction */
+  var MAX_BEND = 0.16;    /* stroke bend / length — above this it is a curve */
+  var VP_TOL = 6;         /* degrees — a stroke "aims at" a VP within this */
+  var MIN_F = 0.55;       /* focal / drawing size below which the implied
+                             camera is a fisheye, i.e. not a box at all */
+  var NOT_A_BOX = 30;     /* round cap when the three sets admit no camera —
+                             the same tier a diverging set caps at */
+  var CORNER_NEAR = 0.16;  /* shared point this close to its own strokes is
+                             a box corner, not a vanishing point */
+  var CORNER_COST = 30;   /* degrees charged per stroke for reading one */
 
   /* ============================================================
      PURE scoring math — no canvas, no DOM below this banner
@@ -68,6 +85,19 @@
     };
   }
 
+  /* RMS perpendicular deviation of a polyline from its fitted line —
+     a big value means the "edge" bends (the classic whole-box-in-one-
+     stroke mistake). Pure: points + fitted seg in, px out. */
+  function strokeBendRMS(points, seg) {
+    var i, d, sum = 0;
+    if (!points.length || !seg) return 0;
+    for (i = 0; i < points.length; i++) {
+      d = (points[i].x - seg.mx) * -seg.dy + (points[i].y - seg.my) * seg.dx;
+      sum += d * d;
+    }
+    return Math.sqrt(sum / points.length);
+  }
+
   function groupMeanAngle(angles, idxs) {
     /* circular mean mod 180 via doubled angles */
     var cx = 0, cy = 0, i, r;
@@ -78,53 +108,50 @@
     return ((Math.atan2(cy, cx) * 90 / Math.PI) % 180 + 180) % 180;
   }
 
-  /* Split segment indices into 3 direction families minimizing total
-     circular spread. Optimal clusters on a circle are contiguous arcs,
-     so brute-forcing the C(n,3) cut positions over the sorted order is
-     exact; prefix sums make each candidate O(1). */
-  function clusterDirections(angles) {
-    var n = angles.length, i;
-    var order = [];
-    for (i = 0; i < n; i++) order.push(i);
-    order.sort(function (a, b) { return angles[a] - angles[b]; });
-    if (n < 3) {
-      return order.map(function (k) { return [k]; });
-    }
-    var px = [0], py = [0], r;
-    for (i = 0; i < n; i++) {
-      r = angles[order[i]] * Math.PI / 90;
-      px.push(px[i] + Math.cos(r));
-      py.push(py[i] + Math.sin(r));
-    }
-    var tx = px[n], ty = py[n];
-    function arcCost(a, b) { /* order[a..b-1] */
-      return (b - a) - Math.hypot(px[b] - px[a], py[b] - py[a]);
-    }
-    function wrapCost(c, a) { /* order[c..n-1] + order[0..a-1] */
-      return (n - c + a) - Math.hypot(tx - (px[c] - px[a]), ty - (py[c] - py[a]));
-    }
-    var best = null, bestCost = Infinity, a, b, c, cost;
-    for (a = 0; a < n - 2; a++) {
-      for (b = a + 1; b < n - 1; b++) {
-        for (c = b + 1; c < n; c++) {
-          cost = arcCost(a, b) + arcCost(b, c) + wrapCost(c, a);
-          if (cost < bestCost) { bestCost = cost; best = [a, b, c]; }
-        }
-      }
-    }
-    return [
-      order.slice(best[0], best[1]),
-      order.slice(best[1], best[2]),
-      order.slice(best[2]).concat(order.slice(0, best[0])),
-    ];
+  function segsOf(idxs, segs) {
+    var out = [], i;
+    for (i = 0; i < idxs.length; i++) out.push(segs[idxs[i]]);
+    return out;
   }
 
-  /* Angle clustering cannot separate a shallow box's left and right
-     sets — near the horizon both straddle 0° mod 180 and interleave, so
-     no contiguous arc splits them. The tell is ORIENTED direction:
-     outward from the centroid (mod 360), a left-receding and a
-     right-receding edge point opposite ways even when their line angles
-     collide. */
+  /* Cut the direction circle (mod 180°) at its `want` widest gaps, so
+     the members of each arc share an image angle. This is the honest
+     tool for PARALLEL bundles only — lines that recede to a real
+     vanishing point fan out in angle and must be grouped by their VP
+     instead (see groupByVP). */
+  function angleGroups(idxs, segs, want) {
+    var i, t, ord = idxs.slice(), out = [], run = [];
+    if (want < 1) want = 1;
+    ord.sort(function (a, b) { return segs[a].angle - segs[b].angle; });
+    if (ord.length <= want) {
+      for (i = 0; i < ord.length; i++) out.push([ord[i]]);
+      return out;
+    }
+    var gaps = [], a, b;
+    for (i = 0; i < ord.length; i++) {
+      a = segs[ord[i]].angle;
+      b = segs[ord[(i + 1) % ord.length]].angle;
+      gaps.push({ at: i, g: (i === ord.length - 1) ? (b + 180 - a) : (b - a) });
+    }
+    gaps.sort(function (p, q) { return q.g - p.g; });
+    var cuts = [];
+    for (i = 0; i < want; i++) cuts.push(gaps[i].at);
+    cuts.sort(function (p, q) { return p - q; });
+    /* walk the ring starting just after a cut so every arc closes */
+    var start = (cuts[cuts.length - 1] + 1) % ord.length, idx;
+    for (t = 0; t < ord.length; t++) {
+      idx = (start + t) % ord.length;
+      run.push(ord[idx]);
+      if (cuts.indexOf(idx) !== -1) { out.push(run); run = []; }
+    }
+    if (run.length) out.push(run);
+    return out;
+  }
+
+  /* Which way does a set RECEDE? Used only to name the rows, and only
+     oriented direction can say: a shallow box's left and right sets sit
+     at nearly the same line angle (both near the horizon, mod 180), but
+     pointing outward from the centroid mod 360 they aim opposite ways. */
   function orientedAngles(pool, segs, cx, cy) {
     var out = [], i, s, ox, oy, ex, ey;
     for (i = 0; i < pool.length; i++) {
@@ -149,145 +176,12 @@
     return ((Math.atan2(sy, sx) * 180 / Math.PI) % 360 + 360) % 360;
   }
 
-  function familyOf(g, segs, cx, cy, size) {
-    var members = [], i;
-    for (i = 0; i < g.length; i++) members.push(segs[g[i]]);
-    return analyzeFamily(members, cx, cy, size);
-  }
-
   /* angular miss (degrees) of a segment's line aiming at a point */
   function missDeg(s, p) {
     var d = Math.hypot(p.x - s.mx, p.y - s.my);
     if (d < 1e-6) return 0;
     var aim = ((Math.atan2(p.y - s.my, p.x - s.mx) * 180 / Math.PI) % 180 + 180) % 180;
     return angleDistDeg(aim, s.angle);
-  }
-
-  /* Is this pool of same-angled lines genuinely TWO edge sets (a shallow
-     box's left + right) rather than one sloppy bundle? Seed a candidate
-     VP from every pair of lines, gather the members that aim at it
-     (angular miss < 3.5°), and accept only when BOTH resulting lobes
-     converge coherently to VPs on opposite sides of the box — one
-     bundle of near-parallel scribble can't do that (its lobes read
-     "parallel" or spray). Midpoint position deliberately plays no part:
-     a transparent box's hidden edges sit across the centroid from their
-     own set. Returns the two lobes, or null. */
-  function genuineTwoSets(pool, segs, cx, cy, size) {
-    var n = pool.length, i, j, k, vp, la, lb, oa;
-    var best = null, bestQ = -1;
-    if (n < 4) return null;
-    function segsOf(g) {
-      var out = [], m;
-      for (m = 0; m < g.length; m++) out.push(segs[g[m]]);
-      return out;
-    }
-    /* Occam gate: if the pool already reads well as ONE family, a
-       two-set reading must clearly beat it — otherwise a noisy single
-       set gets carved into two unfalsifiable 2-line lobes. */
-    var one = familyOf(pool, segs, cx, cy, size);
-    var beat = one.score + 10;
-    function consider(la0, lb0) {
-      var la = la0, lb = lb0, na, nb, va, vb, fa, fb, it, dot, q;
-      if (la.length < 2 || lb.length < 2) return;
-      /* 2-means refinement: a shallow box's centre edges lie almost on
-         the horizon and aim at BOTH VPs — re-deal each edge to the VP
-         it misses least until stable */
-      for (it = 0; it < 4; it++) {
-        va = bestFitVP(segsOf(la));
-        vb = bestFitVP(segsOf(lb));
-        if (!va || !vb) break;
-        na = []; nb = [];
-        for (k = 0; k < n; k++) {
-          (missDeg(segs[pool[k]], va) <= missDeg(segs[pool[k]], vb) ? na : nb).push(pool[k]);
-        }
-        if (na.length < 2 || nb.length < 2) break;
-        if (na.length === la.length && String(na) === String(la)) break;
-        la = na; lb = nb;
-      }
-      if (la.length < 2 || lb.length < 2) return;
-      fa = familyOf(la, segs, cx, cy, size);
-      fb = familyOf(lb, segs, cx, cy, size);
-      if (fa.verdict !== 'converging' || fb.verdict !== 'converging') return;
-      if (fa.score < 50 || fb.score < 50) return;
-      if (Math.min(fa.score, fb.score) < beat) return;
-      dot = (fa.vp.x - cx) * (fb.vp.x - cx) + (fa.vp.y - cy) * (fb.vp.y - cy);
-      if (dot >= 0) return; /* VPs crowd one side — no box does that */
-      q = fa.score + fb.score;
-      if (q > bestQ) { bestQ = q; best = [la, lb]; }
-    }
-    /* seed 1: oriented lobes — pointing-left vs pointing-right members
-       (a visible-edge box's sets sit on their own side of the box) */
-    oa = orientedAngles(pool, segs, cx, cy);
-    la = []; lb = [];
-    for (k = 0; k < n; k++) {
-      (oa[k] > 90 && oa[k] < 270 ? la : lb).push(pool[k]);
-    }
-    consider(la, lb);
-    /* seeds 2…: every pair of lines proposes its own VP */
-    for (i = 0; i < n; i++) {
-      for (j = i + 1; j < n; j++) {
-        vp = bestFitVP([segs[pool[i]], segs[pool[j]]]);
-        if (!vp) continue;
-        la = []; lb = [];
-        for (k = 0; k < n; k++) {
-          (missDeg(segs[pool[k]], vp) < 3.5 ? la : lb).push(pool[k]);
-        }
-        if (la.length < 2 || lb.length < 2) {
-          /* lopsided threshold split (noisy seed) — start from just the
-             seed pair vs the rest and let the refinement sort them */
-          la = [pool[i], pool[j]];
-          lb = [];
-          for (k = 0; k < n; k++) {
-            if (pool[k] !== pool[i] && pool[k] !== pool[j]) lb.push(pool[k]);
-          }
-        }
-        consider(la, lb);
-      }
-    }
-    return best;
-  }
-
-  /* Groups within MERGE_DEG of each other are either one direction drawn
-     twice (6 near-identical strokes must not fake 3 families — fold them)
-     or a shallow box's two real sets (keep those, after re-dealing any
-     interleaved members to their true side). */
-  function resolveDirections(groups, segs, angles, tol, cx, cy, size) {
-    var i, j, pool, lobes, merged = true;
-    /* re-deal pass: genuine close pairs get members re-dealt by side */
-    for (i = 0; i < groups.length; i++) {
-      for (j = i + 1; j < groups.length; j++) {
-        if (angleDistDeg(groupMeanAngle(angles, groups[i]), groupMeanAngle(angles, groups[j])) >= tol) continue;
-        pool = groups[i].concat(groups[j]);
-        lobes = genuineTwoSets(pool, segs, cx, cy, size);
-        if (lobes) { groups[i] = lobes[0]; groups[j] = lobes[1]; }
-      }
-    }
-    /* merge pass: close pairs that are not genuinely two sets fold together */
-    while (merged && groups.length > 1) {
-      merged = false;
-      for (i = 0; i < groups.length && !merged; i++) {
-        for (j = i + 1; j < groups.length && !merged; j++) {
-          if (angleDistDeg(groupMeanAngle(angles, groups[i]), groupMeanAngle(angles, groups[j])) >= tol) continue;
-          pool = groups[i].concat(groups[j]);
-          if (genuineTwoSets(pool, segs, cx, cy, size)) continue;
-          groups[i] = pool;
-          groups.splice(j, 1);
-          merged = true;
-        }
-      }
-    }
-    /* deal pass: a sloppy shallow box can land BOTH its horizontal sets
-       in one angular cluster — if we came out short of three families,
-       deal any wide bundle into genuine opposite lobes */
-    for (i = 0; groups.length < 3 && i < groups.length; i++) {
-      if (groups[i].length < 4) continue;
-      lobes = genuineTwoSets(groups[i], segs, cx, cy, size);
-      if (lobes) {
-        groups.splice(i, 1, lobes[0], lobes[1]);
-        i = -1; /* rescan from the top */
-      }
-    }
-    return groups;
   }
 
   /* Best-fit VP of a pencil of lines: the point minimizing summed
@@ -309,14 +203,240 @@
     return { x: (a22 * b1 - a12 * b2) / det, y: (a11 * b2 - a12 * b1) / det };
   }
 
-  /* The classic mistake: a family whose lines meet on the WRONG side —
-     the set sits on one side of the box and recedes away from it, yet
-     its common point lands back across the box (far edge drawn longer
-     than near edge). Only the family's overall position says which side
-     it recedes toward: single edges sit perpendicular-offset from the
-     centroid (a box's verticals straddle it left and right), so judge
-     by the family's MEAN midpoint. A family centred on the box (mean
-     offset under 15% of the drawing) has no honest side — no verdict. */
+  /* A usable meeting point for any family: the best-fit VP, or — when
+     the pencil is exactly parallel and has none — a synthetic point far
+     down the family's mean direction, so "which VP does this stroke aim
+     at?" stays answerable for every family including the parallel one. */
+  function familyVP(members) {
+    var vp = bestFitVP(members), i, sx = 0, sy = 0, mx = 0, my = 0, r;
+    if (vp) return vp;
+    if (!members.length) return null;
+    for (i = 0; i < members.length; i++) {
+      r = members[i].angle * Math.PI / 90;
+      sx += Math.cos(r); sy += Math.sin(r);
+      mx += members[i].mx; my += members[i].my;
+    }
+    r = Math.atan2(sy, sx) / 2; /* circular mean angle, mod 180 */
+    return {
+      x: mx / members.length + 1e7 * Math.cos(r),
+      y: my / members.length + 1e7 * Math.sin(r),
+    };
+  }
+
+  /* k-means over the three meeting points: re-fit each family's shared
+     VP, re-deal EVERY stroke to the point it misses least, repeat until
+     the deal stops moving. Every stroke lands in exactly one family, so
+     nothing a player drew escapes the score. */
+  function refineByVP(groups, segs) {
+    var it, i, j, k, vps, next, bi, bd, d, sig, prev = '';
+    for (it = 0; it < 12; it++) {
+      vps = [];
+      for (i = 0; i < groups.length; i++) {
+        vps.push(groups[i].length ? familyVP(segsOf(groups[i], segs)) : null);
+      }
+      next = [];
+      for (i = 0; i < groups.length; i++) next.push([]);
+      for (k = 0; k < segs.length; k++) {
+        bi = -1; bd = Infinity;
+        for (j = 0; j < vps.length; j++) {
+          if (!vps[j]) continue;
+          d = missDeg(segs[k], vps[j]);
+          if (d < bd) { bd = d; bi = j; }
+        }
+        next[bi < 0 ? 0 : bi].push(k);
+      }
+      /* a starved family means the re-deal overreached — keep the last
+         honest grouping rather than reporting an empty row */
+      for (i = 0; i < next.length; i++) if (!next[i].length) return groups;
+      sig = next.join('|');
+      if (sig === prev) return next;
+      prev = sig;
+      groups = next;
+    }
+    return groups;
+  }
+
+  /* ---- direction families by shared VANISHING POINT ----
+     One 3D direction does NOT project to one image angle. Its edges
+     radiate from a shared VP, so a three-quarter box fans a single
+     family across 40°+ of image angle while neighbouring families
+     interleave — angle clustering cannot separate the axes at all. The
+     invariant that survives perspective is the vanishing point itself.
+     So: every pair of strokes proposes a VP (RANSAC-style), the
+     candidate the most strokes aim at (within VP_TOL) claims a family,
+     the unclaimed strokes re-vote for the next, and a final k-means
+     pass re-deals everything to the point it misses least. Genuinely
+     parallel bundles have no finite VP to vote for; they fall through
+     to the leftover pass, where a shared image angle IS the honest
+     signal. */
+  function groupByVP(segs, size) {
+    var n = segs.length, i, j, k, v, inl, cands = [], all = [];
+    if (n < 2) return n ? [[0]] : [];
+    for (i = 0; i < n; i++) all.push(i);
+
+    function inliersOf(vp) {
+      var out = [], t;
+      for (t = 0; t < n; t++) if (missDeg(segs[t], vp) < VP_TOL) out.push(t);
+      return out;
+    }
+    /* every pair of strokes proposes the point its two lines share */
+    for (i = 0; i < n; i++) {
+      for (j = i + 1; j < n; j++) {
+        v = bestFitVP([segs[i], segs[j]]);
+        if (!v) continue;
+        inl = inliersOf(v);
+        if (inl.length >= 2) cands.push({ vp: v, inl: inl });
+      }
+    }
+    /* plus one pseudo-candidate per angle band: an exactly parallel
+       bundle shares no finite point, so no pair can nominate it */
+    var bands = angleGroups(all, segs, 3);
+    for (i = 0; i < bands.length; i++) {
+      v = familyVP(segsOf(bands[i], segs));
+      if (v) cands.push({ vp: v, inl: inliersOf(v) });
+    }
+    /* strongest first, then dedup: pairs drawn from one family all
+       nominate the same point, and 600 copies of it help nobody. Only
+       near-IDENTICAL votes are folded (Jaccard, not overlap-of-the-
+       smaller): a true 3-line pencil often shares members with a larger
+       accidental one, and dropping it as a "duplicate" would put the
+       honest reading out of reach of the search below. */
+    cands.sort(function (p, q) { return q.inl.length - p.inl.length; });
+    var keep = [], dup, ov, t;
+    for (i = 0; i < cands.length && keep.length < 12; i++) {
+      dup = false;
+      for (j = 0; j < keep.length && !dup; j++) {
+        ov = 0;
+        for (t = 0; t < cands[i].inl.length; t++) {
+          if (keep[j].inl.indexOf(cands[i].inl[t]) !== -1) ov++;
+        }
+        if (ov > 0.8 * (cands[i].inl.length + keep[j].inl.length - ov)) dup = true;
+      }
+      if (!dup) keep.push(cands[i]);
+    }
+    if (keep.length < 3) {
+      /* too few distinct pencils to triangulate — fall back to angle
+         bands, which is exactly the right reading for parallel work */
+      return refineByVP(angleGroups(all, segs, 3), segs);
+    }
+    /* Try every triple of surviving candidates and keep the reading that
+       explains ALL the strokes with the least total angular miss. Greedy
+       "biggest vote first" is not enough: a chance alignment between two
+       families can out-vote a true pencil and then steal its members. */
+    var best = null, bestCost = Infinity, cost;
+    for (i = 0; i < keep.length; i++) {
+      for (j = i + 1; j < keep.length; j++) {
+        for (k = j + 1; k < keep.length; k++) {
+          var g = refineByVP(
+            dealTo([keep[i].vp, keep[j].vp, keep[k].vp], segs), segs);
+          cost = groupingCost(g, segs, size);
+          if (cost < bestCost) { bestCost = cost; best = g; }
+        }
+      }
+    }
+    if (!best) return refineByVP(angleGroups(all, segs, 3), segs);
+    return refineByVP(polish(best, segs, size), segs);
+  }
+
+  /* hand every stroke to whichever of these points it misses least */
+  function dealTo(vps, segs) {
+    var out = [], i, j, bi, bd, d;
+    for (i = 0; i < vps.length; i++) out.push([]);
+    for (i = 0; i < segs.length; i++) {
+      bi = 0; bd = Infinity;
+      for (j = 0; j < vps.length; j++) {
+        if (!vps[j]) continue;
+        d = missDeg(segs[i], vps[j]);
+        if (d < bd) { bd = d; bi = j; }
+      }
+      out[bi].push(i);
+    }
+    return out;
+  }
+
+  /* Distance from a point to a stroke's finite extent (not its infinite
+     line) — how the corner test below tells "meets there" from "points
+     there". */
+  function distToSeg(s, p) {
+    var vx = s.x2 - s.x1, vy = s.y2 - s.y1, t;
+    var L2 = vx * vx + vy * vy;
+    if (L2 < 1e-9) return Math.hypot(p.x - s.x1, p.y - s.y1);
+    t = clamp(((p.x - s.x1) * vx + (p.y - s.y1) * vy) / L2, 0, 1);
+    return Math.hypot(p.x - (s.x1 + t * vx), p.y - (s.y1 + t * vy));
+  }
+
+  /* Total angular miss of a reading: how many degrees of "my lines do
+     not actually meet there" the whole drawing costs under this split.
+     Two corrections keep the cheapest reading an honest one:
+
+     · a lone line is charged VP_TOL rather than the 0 it would score
+       against a point fitted to itself, or the cheapest reading of any
+       awkward stroke would be to give it a family of its own; and
+
+     · a pencil through a box CORNER is charged too. The three edges
+       meeting at a corner are exactly concurrent there, so by fit alone
+       a corner is a flawless "vanishing point" — a 9-edge box can be
+       carved into three perfect corner-pencils that explain every
+       stroke with zero error and mean nothing. A real VP lies far off
+       the edges it governs; a corner sits on them. */
+  function groupingCost(groups, segs, size) {
+    var i, j, vp, sum = 0, reach, members;
+    for (i = 0; i < groups.length; i++) {
+      if (!groups[i].length) return Infinity;
+      if (groups[i].length < 2) { sum += VP_TOL; continue; }
+      members = segsOf(groups[i], segs);
+      vp = familyVP(members);
+      if (!vp) continue;
+      reach = Infinity;
+      for (j = 0; j < members.length; j++) {
+        reach = Math.min(reach, distToSeg(members[j], vp));
+      }
+      if (reach < CORNER_NEAR * size) sum += CORNER_COST * groups[i].length;
+      for (j = 0; j < groups[i].length; j++) sum += missDeg(segs[groups[i][j]], vp);
+    }
+    return sum;
+  }
+
+  /* Local descent out of a bad basin: move one stroke at a time to
+     whichever family makes the whole reading cheaper, keeping every
+     family at two strokes or more. The triple search above lands close;
+     this walks the last step when an accidental pencil out-voted a true
+     one during seeding. */
+  function polish(groups, segs, size) {
+    var pass, i, j, k, cur, bestCost, bestMove, cand, c, from;
+    cur = groupingCost(groups, segs, size);
+    for (pass = 0; pass < 6; pass++) {
+      bestCost = cur; bestMove = null;
+      for (i = 0; i < groups.length; i++) {
+        if (groups[i].length <= 2) continue;
+        for (k = 0; k < groups[i].length; k++) {
+          for (j = 0; j < groups.length; j++) {
+            if (j === i) continue;
+            cand = [];
+            for (from = 0; from < groups.length; from++) cand.push(groups[from].slice());
+            cand[i].splice(k, 1);
+            cand[j].push(groups[i][k]);
+            c = groupingCost(cand, segs, size);
+            if (c < bestCost - 1e-9) { bestCost = c; bestMove = cand; }
+          }
+        }
+      }
+      if (!bestMove) break;
+      groups = bestMove; cur = bestCost;
+    }
+    return groups;
+  }
+
+  /* Does this family sit on one side of the box yet meet back across it
+     (far edge drawn longer than near edge)? Judged by the family's MEAN
+     midpoint, since single edges sit perpendicular-offset from the
+     centroid; a family centred on the box (mean offset under 15% of the
+     drawing) has no honest side and abstains. This is a TIEBREAK only —
+     it is the position heuristic cameraCheckDivergence consults to pick
+     which of two mutually impossible families to blame. It must never
+     convict on its own: a legitimately lopsided family (a box drawn with
+     only its visible edges) trips it, so the verdict belongs to the
+     real-camera test, which is geometry rather than placement. */
   function wrongSideOfBox(segs, vp, cx, cy, size) {
     var i, ox = 0, oy = 0;
     for (i = 0; i < segs.length; i++) { ox += segs[i].mx - cx; oy += segs[i].my - cy; }
@@ -340,11 +460,13 @@
                    ANGULAR miss (extend each stroke — by how many
                    degrees does it miss the shared VP?), which stays
                    honest and monotone where raw intersection scatter is
-                   ill-conditioned: score = 100·(1 − miss°/11). A
+                   ill-conditioned: full credit inside half a degree,
+                   then a ramp to 0 at 8° of median miss. A
                    2-line family is capped at 80 — two lines meet
                    *somewhere* by definition, so they can never prove a
                    tight VP (the hint says a full box is 9–12 edges).
-       diverging: converging score · 0.35, capped at 30 */
+       diverging: converging score · 0.35, capped at 30 — set by
+                   cameraCheckDivergence, never by one family alone */
   function analyzeFamily(segs, cx, cy, size) {
     if (segs.length < 2) return { verdict: 'missing', score: 25, vp: null, spread: 0 };
     var i;
@@ -360,10 +482,13 @@
     for (i = 0; i < segs.length; i++) {
       maxDev = Math.max(maxDev, angleDistDeg(segs[i].angle, meanA));
     }
+    /* two strokes prove nothing on their own — they meet *somewhere* by
+       definition, and they are parallel to each other by definition too */
+    var cap = (segs.length === 2) ? 80 : 100;
     var vp = bestFitVP(segs);
-    if (!vp) return { verdict: 'parallel', score: 85, vp: null, spread: 0 };
+    if (!vp) return { verdict: 'parallel', score: Math.min(85, cap), vp: null, spread: 0 };
     if (maxDev < 4 && Math.hypot(vp.x - cx, vp.y - cy) > 8 * size) {
-      return { verdict: 'parallel', score: 85, vp: null, spread: 0 };
+      return { verdict: 'parallel', score: Math.min(85, cap), vp: null, spread: 0 };
     }
     var miss = [], aim, d;
     for (i = 0; i < segs.length; i++) {
@@ -373,36 +498,186 @@
       miss.push(angleDistDeg(aim, segs[i].angle));
     }
     var spread = median(miss); /* degrees of miss, 0 = razor-tight */
-    var score = 100 * clamp(1 - spread / 11, 0, 1);
-    if (segs.length === 2) score = Math.min(score, 80);
-    if (wrongSideOfBox(segs, vp, cx, cy, size)) {
-      return { verdict: 'diverging', score: clamp(score * 0.35, 0, 30), vp: vp, spread: spread };
-    }
+    /* full-credit plateau: within half a degree of a shared VP is as
+       tight as a human hand gets — that IS 100 (GAME_GUIDE: 100 must
+       be earnable); beyond it the old ramp, rescaled to still hit 0
+       at 11° of median miss */
+    var score = spread <= 0.5 ? 100 : 100 * clamp(1 - (spread - 0.5) / 7.5, 0, 1);
+    score = Math.min(score, cap);
+    /* divergence is NOT decided here: one family alone cannot prove it.
+       cameraCheckDivergence rules on the three together, against the
+       real-camera condition. */
     return { verdict: 'converging', score: score, vp: vp, spread: spread };
   }
 
-  /* Second divergence detector: two families whose VPs sit in nearly the
-     same direction from the box is the broken-box signature — a real
-     box's vanishing points never crowd one side (a centred family dodges
-     the mean-midpoint test, but its false VP still lands next to a
-     neighbour's). Blame the family whose convergence is looser. */
-  function crossCheckDivergence(fams, cx, cy) {
-    var i, j, a, b, ax, ay, bx, by, la, lb, worse;
-    for (i = 0; i < fams.length; i++) {
-      for (j = i + 1; j < fams.length; j++) {
-        a = fams[i]; b = fams[j];
-        if (!a.vp || !b.vp) continue;
-        ax = a.vp.x - cx; ay = a.vp.y - cy; la = Math.hypot(ax, ay);
-        bx = b.vp.x - cx; by = b.vp.y - cy; lb = Math.hypot(bx, by);
-        if (la < 1 || lb < 1) continue;
-        if ((ax * bx + ay * by) / (la * lb) <= 0.82) continue; /* ≳35° apart — fine */
-        worse = (a.spread >= b.spread) ? a : b;
-        if (worse.verdict !== 'diverging') {
-          worse.verdict = 'diverging';
-          worse.score = clamp(worse.score * 0.35, 0, 30);
-        }
+  /* ---- real-camera consistency ----
+     A pinhole camera with principal point P and focal length f puts the
+     VPs of two ORTHOGONAL box directions at points a, b with
+     (a−P)·(b−P) = −f² — strictly negative, no tuned threshold. */
+  function famDot(a, b, px2, py2) {
+    return (a.x - px2) * (b.x - px2) + (a.y - py2) * (b.y - py2);
+  }
+
+  /* Orthocenter of the VP triangle. Three MUTUALLY ORTHOGONAL
+     directions seen by one pinhole camera put their principal point
+     exactly at the orthocenter of their three vanishing points — and
+     there the three pairwise dots become algebraically identical, so
+     f² = −(a−H)·(b−H) is one number rather than three disagreeing ones.
+     That removes the old fudge of assuming P at the drawing's centroid:
+     the camera is now READ OFF the drawing instead of guessed, so a box
+     sketched in a sheet corner is judged on its convergence and not on
+     where it sits. */
+  function orthocenter(a, b, c) {
+    var d = 2 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+    if (Math.abs(d) < 1e-9) return null; /* collinear VPs — no triangle */
+    var a2 = a.x * a.x + a.y * a.y, b2 = b.x * b.x + b.y * b.y, c2 = c.x * c.x + c.y * c.y;
+    var ox = (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d;
+    var oy = (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d;
+    /* H = A + B + C − 2·O, the Euler-line relation to the circumcenter */
+    return { x: a.x + b.x + c.x - 2 * ox, y: a.y + b.y + c.y - 2 * oy };
+  }
+
+  /* The one camera three families imply, or null when they imply none.
+     f² ≤ 0 (an obtuse VP triangle) means NO camera anywhere can see
+     these three sets as one box — that is what a diverging box really
+     is. A real but absurdly wide lens (focal under MIN_F of the
+     drawing) is the same verdict wearing a disguise: three sprayed
+     pencils always meet somewhere, and the "camera" that explains them
+     is a fisheye no sketch was ever drawn through. */
+  function fitCamera(fams, size) {
+    if (fams.length !== 3) return null;
+    var H = orthocenter(fams[0].vp, fams[1].vp, fams[2].vp);
+    if (!H) return null;
+    var t = famDot(fams[0].vp, fams[1].vp, H.x, H.y);
+    if (!(t < 0)) return null;
+    var f = Math.sqrt(-t);
+    if (!isFinite(f) || f < MIN_F * size) return null;
+    return {
+      f: f, px: H.x, py: H.y,
+      vpA: fams[0].vp, vpB: fams[1].vp,
+      maxSpread: Math.max(fams[0].spread, fams[1].spread, fams[2].spread),
+    };
+  }
+
+  /* 3D direction implied by a VP under camera (P, f) */
+  function dir3(vp, px2, py2, f) {
+    var x = vp.x - px2, y = vp.y - py2, n = Math.hypot(x, y, f);
+    return { x: x / n, y: y / n, z: f / n };
+  }
+
+  /* Divergence verdict. Preferred route: all three sets have a finite
+     meeting point, so the orthocenter camera settles it outright — it
+     exists, or the drawing is not a box. When it does not exist, blame
+     ONE family (the reveal has to point somewhere), preferring the set
+     that sits across the box from its own VP and falling back to the
+     loosest. Fallback route: a parallel family has no finite VP to put
+     in the triangle, so the surviving pairs are checked the weaker way,
+     (a−P)·(b−P) < 0 about the drawing's centre. Returns the fitted
+     camera (or null) so the reveal can reproject a true box. */
+  function cameraCheckDivergence(fams, segs, cx, cy, size) {
+    var i, j, a, b, conv = [], ok = [], cam;
+    function membersOf(f) {
+      var out = [], m;
+      for (m = 0; m < f.idxs.length; m++) out.push(segs[f.idxs[m]]);
+      return out;
+    }
+    function demote(f) {
+      if (f.verdict === 'diverging') return;
+      f.verdict = 'diverging';
+      f.score = clamp(f.score * 0.35, 0, 30);
+    }
+    function guiltiest(list) {
+      var k, guilty = null;
+      for (k = 0; k < list.length; k++) {
+        if (!wrongSideOfBox(membersOf(list[k]), list[k].vp, cx, cy, size)) continue;
+        if (!guilty || list[k].spread > guilty.spread) guilty = list[k];
+      }
+      if (guilty) return guilty;
+      guilty = list[0];
+      for (k = 1; k < list.length; k++) if (list[k].spread > guilty.spread) guilty = list[k];
+      return guilty;
+    }
+    function converging() {
+      var out = [], k;
+      for (k = 0; k < fams.length; k++) {
+        if (fams[k].vp && fams[k].verdict === 'converging') out.push(fams[k]);
+      }
+      return out;
+    }
+    conv = converging();
+    if (conv.length === 3) {
+      cam = fitCamera(conv, size);
+      if (cam) return cam;
+      demote(guiltiest(conv));
+    }
+    conv = converging();
+    for (i = 0; i < conv.length; i++) {
+      for (j = i + 1; j < conv.length; j++) {
+        a = conv[i]; b = conv[j];
+        /* one liar explains many bad pairs — skip already-demoted */
+        if (a.verdict !== 'converging' || b.verdict !== 'converging') continue;
+        if (famDot(a.vp, b.vp, cx, cy) < 0) continue; /* a real camera exists */
+        var wsA = wrongSideOfBox(membersOf(a), a.vp, cx, cy, size);
+        var wsB = wrongSideOfBox(membersOf(b), b.vp, cx, cy, size);
+        if (wsA !== wsB) demote(wsA ? a : b);
+        else demote(a.spread >= b.spread ? a : b);
       }
     }
+    ok = converging();
+    ok.sort(function (p, q) { return p.spread - q.spread; });
+    if (ok.length < 2) return null;
+    var f2 = -famDot(ok[0].vp, ok[1].vp, cx, cy);
+    if (f2 <= 0) return null;
+    var f = Math.sqrt(f2);
+    if (f < MIN_F * size) return null;
+    return {
+      f: f, px: cx, py: cy, vpA: ok[0].vp, vpB: ok[1].vp,
+      maxSpread: Math.max(ok[0].spread, ok[1].spread),
+    };
+  }
+
+  /* Reproject a TRUE rectangular box through the fitted camera: take the
+     two best VP directions, complete the triad with their cross product
+     (orthogonal by construction — f was chosen to make d1·d2 = 0), and
+     project 8 corners with x = P + f·(X/Z, Y/Z) about the camera's own
+     principal point P. The cube is hung on the ray that passes through
+     (cx, cy) so the ghost lands over the player's box rather than over
+     the optical axis. Returns 12 edges in sheet px, or null when a
+     corner pokes behind the lens. */
+  function correctedBoxEdges(cam, cx, cy, size) {
+    var d1 = dir3(cam.vpA, cam.px, cam.py, cam.f);
+    var d2 = dir3(cam.vpB, cam.px, cam.py, cam.f);
+    var d3 = {
+      x: d1.y * d2.z - d1.z * d2.y,
+      y: d1.z * d2.x - d1.x * d2.z,
+      z: d1.x * d2.y - d1.y * d2.x,
+    };
+    var n = Math.hypot(d3.x, d3.y, d3.z);
+    if (n < 0.35) return null;
+    d3 = { x: d3.x / n, y: d3.y / n, z: d3.z / n };
+    var Z0 = cam.f, half = 0.31 * size;
+    /* centre of the ghost: depth Z0 along the ray through (cx, cy) */
+    var Cx = (cx - cam.px) / cam.f * Z0, Cy = (cy - cam.py) / cam.f * Z0;
+    var verts = [], i, j, a, b, cc, X, Y, Z, k;
+    for (i = 0; i < 8; i++) {
+      a = (i & 1) ? 1 : -1;
+      b = (i & 2) ? 1 : -1;
+      cc = (i & 4) ? 1 : -1;
+      X = Cx + (a * d1.x + b * d2.x + cc * d3.x) * half;
+      Y = Cy + (a * d1.y + b * d2.y + cc * d3.y) * half;
+      Z = Z0 + (a * d1.z + b * d2.z + cc * d3.z) * half;
+      if (!(Z >= 0.12 * Z0)) return null;
+      verts.push({ x: cam.px + cam.f * X / Z, y: cam.py + cam.f * Y / Z });
+      if (!isFinite(verts[i].x) || !isFinite(verts[i].y)) return null;
+    }
+    var edges = [];
+    for (i = 0; i < 8; i++) {
+      for (j = 0; j < 3; j++) {
+        k = i ^ (1 << j);
+        if (k > i) edges.push({ x1: verts[i].x, y1: verts[i].y, x2: verts[k].x, y2: verts[k].y });
+      }
+    }
+    return edges;
   }
 
   /* Name the families relative to each other: the one nearest vertical
@@ -421,28 +696,33 @@
       else if (phis[i] > 90 && phis[i] < 270) labels.push({ key: 'l', label: '← left set' });
       else labels.push({ key: 'r', label: '→ right set' });
     }
-    var keys = ['l', 'r'], dup, steep, k;
+    /* Two or three sets can land on the same side; rank them steepest
+       first and suffix so no two rows ever read identically. */
+    var keys = ['l', 'r'], dup, k;
+    var pair = [' (steeper)', ' (flatter)'];
+    var trio = [' (steepest)', ' (middle)', ' (flattest)'];
     for (k = 0; k < keys.length; k++) {
       dup = [];
       for (i = 0; i < labels.length; i++) if (labels[i].key === keys[k]) dup.push(i);
       if (dup.length < 2) continue;
-      steep = dup[0];
-      for (j = 1; j < dup.length; j++) {
-        if (angleDistDeg(means[dup[j]], 90) < angleDistDeg(means[steep], 90)) steep = dup[j];
-      }
+      dup.sort(function (p, q) {
+        return angleDistDeg(means[p], 90) - angleDistDeg(means[q], 90);
+      });
       for (j = 0; j < dup.length; j++) {
-        labels[dup[j]].label += (dup[j] === steep) ? ' (steeper)' : ' (flatter)';
+        labels[dup[j]].label += (dup.length === 2 ? pair[j] : trio[j]) || (' #' + (j + 1));
       }
     }
     return labels;
   }
 
   function missingLabel(existing) {
-    var i;
-    for (i = 0; i < existing.length; i++) if (existing[i].key === 'v') {
-      return { key: '?', label: '• third set' };
-    }
-    return { key: 'v', label: '↕ verticals' };
+    var i, hasV = false;
+    for (i = 0; i < existing.length; i++) if (existing[i].key === 'v') hasV = true;
+    if (!hasV) return { key: 'v', label: '↕ verticals' };
+    /* distinct label per missing slot — two rows must never read alike */
+    return (existing.length < 2)
+      ? { key: '?', label: '• second set' }
+      : { key: '??', label: '• third set' };
   }
 
   /* Whole drawing → { score, families[3], cx, cy, size }.
@@ -461,7 +741,7 @@
     for (i = 0; i < segs.length; i++) { cx += segs[i].mx; cy += segs[i].my; }
     cx /= segs.length; cy /= segs.length;
 
-    var groups = resolveDirections(clusterDirections(angles), segs, angles, MERGE_DEG, cx, cy, size);
+    var groups = groupByVP(segs, size);
     var fams = [], means = [], phis = [], g, members, j, res, lab, labels;
     for (i = 0; i < groups.length && i < 3; i++) {
       g = groups[i];
@@ -475,7 +755,15 @@
         verdict: res.verdict, score: res.score, vp: res.vp, spread: res.spread,
       });
     }
-    crossCheckDivergence(fams, cx, cy);
+    /* Was the exact test even available? Only when all three sets have
+       a finite meeting point; a parallel family has none to trilaterate
+       with, and then no verdict of "impossible" may be pronounced. */
+    var testable = fams.length === 3, notABox = false;
+    for (i = 0; i < fams.length && testable; i++) {
+      if (fams[i].verdict !== 'converging' || !fams[i].vp) testable = false;
+    }
+    var cam = cameraCheckDivergence(fams, segs, cx, cy, size);
+    if (testable && !cam) notABox = true;
     labels = assignLabels(means, phis);
     for (i = 0; i < fams.length; i++) {
       fams[i].key = labels[i].key;
@@ -488,10 +776,22 @@
         verdict: 'missing', score: 25, vp: null, spread: 0,
       });
     }
-    var rank = { l: 0, v: 1, r: 2, '?': 3 };
+    var rank = { l: 0, v: 1, r: 2, '?': 3, '??': 4 };
     fams.sort(function (p, q) { return (rank[p.key] || 0) - (rank[q.key] || 0); });
     var total = (fams[0].score + fams[1].score + fams[2].score) / 3;
-    return { score: Math.round(total), families: fams, cx: cx, cy: cy, size: size };
+    /* Three sets that admit no camera are not a box, however neatly any
+       one of them converges — three pencils always meet SOMEWHERE, and
+       rewarding that would score a fan of scribble like a drawing. The
+       per-family critique still stands so the player sees which set did
+       hold up. */
+    if (notABox) total = Math.min(total, NOT_A_BOX);
+    /* ghost box only when the two anchor VPs are honestly tight —
+       a corrected box fitted to sprayed VPs teaches nothing */
+    var ghost = (cam && cam.maxSpread < 8) ? correctedBoxEdges(cam, cx, cy, size) : null;
+    return {
+      score: Math.round(total), families: fams, notABox: notABox,
+      cx: cx, cy: cy, size: size, ghost: ghost,
+    };
   }
 
   /* one honest critique line per family */
@@ -500,12 +800,20 @@
       if (f.count === 1) return { cls: 'bad', text: 'only one stroke this way — a box needs 2+ per direction' };
       return { cls: 'bad', text: 'missing — a box has edges going three ways' };
     }
-    if (f.verdict === 'parallel') return { cls: 'meh', text: 'parallel — fine (VP near infinity)' };
-    if (f.verdict === 'diverging') return { cls: 'bad', text: 'DIVERGES ✗ — your far edge is longer than your near edge' };
-    /* spread = median angular miss of the shared VP, in degrees */
-    if (f.spread < 1) return { cls: 'good', text: 'converges ✓ tight' };
-    if (f.spread < 2.5) return { cls: 'good', text: 'converges ✓ pretty clean' };
-    if (f.spread < 6) return { cls: 'meh', text: 'converges — loose, your lines miss a shared VP' };
+    if (f.verdict === 'parallel') {
+      return (f.count === 2)
+        ? { cls: 'meh', text: 'parallel — fine, but 2 strokes can’t prove it (caps at 80)' }
+        : { cls: 'meh', text: 'parallel — fine (VP near infinity · caps at 85)' };
+    }
+    if (f.verdict === 'diverging') {
+      return { cls: 'bad', text: 'DIVERGES ✗ — this set meets on the wrong side; no camera sees it with the others' };
+    }
+    /* spread = median angular miss of the shared VP, in degrees;
+       a 2-line family says WHY its score caps at 80 */
+    var two = (f.count === 2) ? ' (2 strokes can’t prove a VP — add more)' : '';
+    if (f.spread < 1) return { cls: 'good', text: 'converges ✓ tight' + two };
+    if (f.spread < 2.5) return { cls: 'good', text: 'converges ✓ pretty clean' + two };
+    if (f.spread < 6) return { cls: 'meh', text: 'converges — loose, your lines miss a shared VP' + two };
     return { cls: 'meh', text: 'barely converges — extensions spray everywhere' };
   }
 
@@ -522,6 +830,7 @@
   var hudBest = document.getElementById('hudBest');
   var edgeCount = document.getElementById('edgeCount');
   var btnCheck = document.getElementById('btnCheck');
+  var btnUndo = document.getElementById('btnUndo');
   var btnClear = document.getElementById('btnClear');
   var critique = document.getElementById('critique');
 
@@ -550,18 +859,25 @@
     return {
       ink: ink,
       muted: cs.getPropertyValue('--muted').trim(),
-      accent: accent,
-      /* accent text needs inking toward graphite on paper for AA
-         contrast (same recipe as the CSS: accent 55% into ink);
-         on the dark sheet pure accent already passes */
+      /* Everything the game paints in the accent is meaning-bearing, so
+         the accent is inked toward graphite on paper (same recipe as the
+         CSS: accent 55% into ink) — raw coral only reaches 3.1:1 on the
+         card, this reaches 5.9:1. On the dark sheet pure accent already
+         passes at 6.4:1. */
       accentText: ArtDaily.theme() === 'dark' ? accent : mixHex(accent, ink, 0.55),
     };
   }
 
-  /* ---- crisp canvas at any devicePixelRatio; height tracks width ---- */
+  /* ---- crisp canvas at any devicePixelRatio; height tracks width ----
+     A resize mid-box rescales everything already drawn by the same
+     factor, so a rotated phone (or a dragged desktop window) keeps the
+     player's strokes where they put them instead of stranding them off
+     the sheet. The fitted lines are rebuilt from the moved points, and
+     any reveal on screen is recomputed from those. */
   var W = 0, H = 0;
   function fitCanvas() {
     var rect = canvas.getBoundingClientRect();
+    var oldW = W;
     W = Math.max(1, Math.round(rect.width));
     H = Math.round(W * 0.7);
     var dpr = window.devicePixelRatio || 1;
@@ -569,6 +885,26 @@
     canvas.height = Math.round(H * dpr);
     canvas.style.height = H + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (oldW > 0 && W !== oldW) rescaleStrokes(W / oldW);
+  }
+
+  function rescaleStrokes(k) {
+    var i, j, pts;
+    for (i = 0; i < strokes.length; i++) {
+      pts = strokes[i].pts;
+      for (j = 0; j < pts.length; j++) { pts[j].x *= k; pts[j].y *= k; }
+      strokes[i].seg = fitSegment(pts);
+    }
+    /* drop any stroke the rescale made degenerate, then re-read the box */
+    for (i = strokes.length - 1; i >= 0; i--) if (!strokes[i].seg) strokes.splice(i, 1);
+    if (live) for (j = 0; j < live.length; j++) { live[j].x *= k; live[j].y *= k; }
+    if (phase === 'result' && strokes.length) {
+      var segs = [];
+      for (i = 0; i < strokes.length; i++) segs.push(strokes[i].seg);
+      result = analyzeBox(segs);
+      if (spotlight >= result.families.length) spotlight = -1;
+    }
+    updateBar();
   }
 
   /* ---- round state ---- */
@@ -578,10 +914,17 @@
   var live = null;           /* in-progress polyline */
   var activePointer = null;  /* pointerId guard */
   var result = null;         /* analyzeBox output, drives the reveal */
+  var spotlight = -1;        /* critique row index lit on the sheet */
 
   function updateBar() {
-    edgeCount.textContent = 'edges: ' + strokes.length;
+    edgeCount.textContent = (phase === 'draw' && strokes.length < MIN_EDGES)
+      ? 'edges: ' + strokes.length + ' / ' + MIN_EDGES
+      : 'edges: ' + strokes.length;
     btnCheck.disabled = (phase !== 'draw') || (strokes.length < MIN_EDGES);
+    btnUndo.disabled = (phase !== 'draw') || !strokes.length;
+    /* during a reveal the only way forward is "new round" — a "clear"
+       that silently spent the round would be a surprising button */
+    btnClear.disabled = (phase !== 'draw') || !strokes.length;
   }
 
   function newRound() {
@@ -589,6 +932,7 @@
     strokes = [];
     live = null;
     result = null;
+    spotlight = -1;
     phase = 'draw';
     critique.hidden = true;
     critique.textContent = '';
@@ -600,7 +944,7 @@
   }
 
   function clearBox() {
-    if (phase === 'result') { newRound(); return; }
+    if (phase !== 'draw' || !strokes.length) return;
     strokes = [];
     live = null;
     hint.textContent = 'cleared — fresh box, same round.';
@@ -608,16 +952,32 @@
     draw();
   }
 
+  function undoStroke() {
+    if (phase !== 'draw' || !strokes.length) return;
+    strokes.pop();
+    hint.textContent = 'stroke undone — ' + strokes.length +
+      ' edge' + (strokes.length === 1 ? '' : 's') + ' stand.';
+    updateBar();
+    draw();
+  }
+
   /* ---- painting (canvas bg stays clear so the CSS dot-grid shows) ---- */
   function draw() {
-    var c = inks(), i, j, pts;
+    var c = inks(), i, j, pts, hi = null;
+    if (result && spotlight >= 0 && result.families[spotlight]) {
+      hi = {};
+      for (i = 0; i < result.families[spotlight].idxs.length; i++) {
+        hi[result.families[spotlight].idxs[i]] = true;
+      }
+    }
     ctx.clearRect(0, 0, W, H);
+    if (phase === 'draw' && !strokes.length && !live) drawGhostIntro(c);
     if (result) drawReveal(c);
-    ctx.strokeStyle = c.ink;
     ctx.lineWidth = 2.25;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     for (i = 0; i < strokes.length; i++) {
+      ctx.strokeStyle = hi ? (hi[i] ? c.accentText : c.muted) : c.ink;
       pts = strokes[i].pts;
       ctx.beginPath();
       ctx.moveTo(pts[0].x, pts[0].y);
@@ -625,6 +985,7 @@
       ctx.stroke();
     }
     if (live && live.length > 1) {
+      ctx.strokeStyle = c.ink;
       ctx.beginPath();
       ctx.moveTo(live[0].x, live[0].y);
       for (j = 1; j < live.length; j++) ctx.lineTo(live[j].x, live[j].y);
@@ -632,32 +993,115 @@
     }
   }
 
-  function drawReveal(c) {
-    var i, f, s, L = W + H;
-    /* every stroke's fitted line, extended faintly across the sheet */
+  /* faint example box on the empty sheet — gone at the first stroke */
+  function drawGhostIntro(c) {
+    function meet2(p1, p2, p3, p4) {
+      var d = (p1.x - p2.x) * (p3.y - p4.y) - (p1.y - p2.y) * (p3.x - p4.x);
+      if (Math.abs(d) < 1e-9) return null;
+      var a = p1.x * p2.y - p1.y * p2.x, b = p3.x * p4.y - p3.y * p4.x;
+      return {
+        x: (a * (p3.x - p4.x) - (p1.x - p2.x) * b) / d,
+        y: (a * (p3.y - p4.y) - (p1.y - p2.y) * b) / d,
+      };
+    }
+    function toward(p, vp, t) {
+      return { x: p.x + (vp.x - p.x) * t, y: p.y + (vp.y - p.y) * t };
+    }
+    var vl = { x: 0.04 * W, y: 0.38 * H }, vr = { x: 0.97 * W, y: 0.38 * H };
+    var nT = { x: 0.52 * W, y: 0.30 * H }, nB = { x: 0.52 * W, y: 0.76 * H };
+    var lT = toward(nT, vl, 0.32), lB = toward(nB, vl, 0.32);
+    var rT = toward(nT, vr, 0.36), rB = toward(nB, vr, 0.36);
+    var bT = meet2(lT, vr, rT, vl), bB = meet2(lB, vr, rB, vl);
+    if (!bT || !bB) return;
+    var e = [
+      [nT, nB], [lT, lB], [rT, rB],
+      [nT, lT], [nT, rT], [nB, lB], [nB, rB],
+      [lT, bT], [rT, bT], [lB, bB], [rB, bB], [bT, bB],
+    ], i;
+    /* alphas here are contrast floors, not taste: --muted at 0.8 clears
+       3:1 against the card in BOTH themes (graphics), and the caption
+       runs at full alpha to clear 4.5:1 as real text */
     ctx.save();
-    ctx.globalAlpha = 0.3;
     ctx.strokeStyle = c.muted;
-    ctx.lineWidth = 1;
-    for (i = 0; i < strokes.length; i++) {
-      s = strokes[i].seg;
+    ctx.globalAlpha = 0.8;
+    ctx.lineWidth = 1.25;
+    ctx.setLineDash([6, 5]);
+    for (i = 0; i < e.length; i++) {
       ctx.beginPath();
-      ctx.moveTo(s.mx - L * s.dx, s.my - L * s.dy);
-      ctx.lineTo(s.mx + L * s.dx, s.my + L * s.dy);
+      ctx.moveTo(e[i][0].x, e[i][0].y);
+      ctx.lineTo(e[i][1].x, e[i][1].y);
       ctx.stroke();
     }
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = c.muted;
+    ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('a box like this — one straight stroke per edge', W / 2, 0.92 * H);
     ctx.restore();
+  }
+
+  /* dash pattern per family so extensions match their critique row */
+  var FAM_DASH = { l: [], v: [3, 5], r: [10, 5] };
+  var FAM_ARROW = { l: '←', v: '↕', r: '→' };
+
+  function drawReveal(c) {
+    var i, j, f, s, L = W + H, lit, dim;
+    /* each family's fitted lines, extended across the sheet — dash-
+       coded to its critique row; a tapped row is spotlit in accent */
     for (i = 0; i < result.families.length; i++) {
       f = result.families[i];
-      if (f.vp) drawVP(c, f.vp, f.verdict === 'diverging');
+      lit = (spotlight === i);
+      dim = (spotlight !== -1 && !lit);
+      /* the extensions ARE the lesson, so they hold 3:1 against the card
+         in both themes (muted at 0.8); only a set the player has
+         deliberately backgrounded by spotlighting another drops below */
+      ctx.save();
+      ctx.globalAlpha = lit ? 1 : (dim ? 0.12 : 0.8);
+      ctx.strokeStyle = lit ? c.accentText : c.muted;
+      ctx.lineWidth = lit ? 1.75 : 1;
+      ctx.setLineDash(FAM_DASH[f.key] || []);
+      for (j = 0; j < f.idxs.length; j++) {
+        s = strokes[f.idxs[j]] && strokes[f.idxs[j]].seg;
+        if (!s) continue;
+        ctx.beginPath();
+        ctx.moveTo(s.mx - L * s.dx, s.my - L * s.dy);
+        ctx.lineTo(s.mx + L * s.dx, s.my + L * s.dy);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    /* ghost corrected box: a true rectangular box reprojected through
+       the camera implied by the two best VPs */
+    if (result.ghost && spotlight === -1) {
+      ctx.save();
+      ctx.strokeStyle = c.accentText;
+      ctx.globalAlpha = 0.85;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 4]);
+      for (i = 0; i < result.ghost.length; i++) {
+        ctx.beginPath();
+        ctx.moveTo(result.ghost[i].x1, result.ghost[i].y1);
+        ctx.lineTo(result.ghost[i].x2, result.ghost[i].y2);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+    for (i = 0; i < result.families.length; i++) {
+      f = result.families[i];
+      if (f.vp) drawVP(c, f, spotlight !== -1 && spotlight !== i);
     }
   }
 
-  function drawVP(c, vp, isDiverging) {
-    var m = 12, tag = isDiverging ? '✗ vp' : 'vp';
+  function drawVP(c, f, dim) {
+    var vp = f.vp, m = 12;
+    var tag = (f.verdict === 'diverging' ? '✗ ' : '') + (FAM_ARROW[f.key] || '•') + ' vp';
     ctx.save();
-    ctx.fillStyle = c.accent;
-    ctx.strokeStyle = c.accent;
+    /* accentText, not raw accent: on paper the raw coral only just
+       clears 3:1, and this marker names a thing */
+    ctx.globalAlpha = dim ? 0.15 : 1;
+    ctx.fillStyle = c.accentText;
+    ctx.strokeStyle = c.accentText;
     ctx.font = '11px ui-monospace, Menlo, Consolas, monospace';
     ctx.textAlign = 'center';
     if (vp.x >= m && vp.x <= W - m && vp.y >= m && vp.y <= H - m) {
@@ -737,19 +1181,27 @@
     draw();
   });
 
+  /* A stroke is accepted as an EDGE only if it is long enough and
+     straight enough. Rejections never cost the player anything — the
+     stroke simply is not recorded, and the hint says why — so a stray
+     tap, a dragged scroll or a whole box scribbled in one go all leave
+     the round exactly as it was. */
   function finishStroke() {
     var seg = live ? fitSegment(live) : null;
-    if (seg && seg.len >= MIN_STROKE && strokes.length < MAX_EDGES) {
+    var bend = seg ? strokeBendRMS(live, seg) : 0;
+    if (!seg || seg.len < MIN_STROKE) {
+      if (seg) hint.textContent = 'stroke ignored — an edge wants ' + MIN_STROKE + 'px+ of committed line.';
+    } else if (bend > MAX_BEND * seg.len) {
+      hint.textContent = 'that stroke curves — one straight stroke per edge, not a whole box in one go.';
+    } else if (strokes.length >= MAX_EDGES) {
+      hint.textContent = 'that is plenty of edges — check it.';
+    } else {
       strokes.push({ pts: live, seg: seg });
       if (strokes.length === MIN_EDGES) {
         hint.textContent = '“check it ✓” is live — more edges give the critique more to chew on.';
       } else if (strokes.length >= MAX_EDGES) {
         hint.textContent = 'that is plenty of edges — check it.';
       }
-    } else if (seg && seg.len < MIN_STROKE) {
-      hint.textContent = 'stroke ignored — an edge wants ' + MIN_STROKE + 'px+ of committed line.';
-    } else if (seg) {
-      hint.textContent = 'that is plenty of edges — check it.';
     }
     live = null;
     activePointer = null;
@@ -774,14 +1226,19 @@
     showToast((res.isNewBest ? 'new best! ' : 'score ') + res.score + ' / 100', res.isNewBest);
   }
 
+  /* One row per edge set. Each row is a button: pressing it spotlights
+     that set on the sheet and dims the other two, pressing it again (or
+     the lit row) drops back to the whole reveal. */
   function renderCritique(r) {
     critique.textContent = '';
-    var i, f, v, row, axis, verdict, score;
+    var i, f, v, row, axis, verdict, score, note;
     for (i = 0; i < r.families.length; i++) {
       f = r.families[i];
       v = verdictFor(f);
-      row = document.createElement('p');
+      row = document.createElement('button');
+      row.type = 'button';
       row.className = 'crit-row';
+      row.setAttribute('aria-pressed', 'false');
       axis = document.createElement('span');
       axis.className = 'crit-axis';
       axis.textContent = f.label + ': ';
@@ -794,9 +1251,31 @@
       row.appendChild(axis);
       row.appendChild(verdict);
       row.appendChild(score);
+      row.addEventListener('click', (function (idx) {
+        return function () { setSpotlight(spotlight === idx ? -1 : idx); };
+      })(i));
       critique.appendChild(row);
     }
+    if (r.notABox) {
+      note = document.createElement('p');
+      note.className = 'crit-row crit-note';
+      note.textContent = 'these three sets cannot belong to one box — no camera sees them together (round caps at ' + NOT_A_BOX + ').';
+      critique.appendChild(note);
+    }
     critique.hidden = false;
+  }
+
+  function setSpotlight(idx) {
+    spotlight = idx;
+    var rows = critique.querySelectorAll('button.crit-row'), i;
+    for (i = 0; i < rows.length; i++) {
+      rows[i].setAttribute('aria-pressed', String(i === idx));
+      rows[i].classList.toggle('is-lit', i === idx);
+    }
+    hint.textContent = (idx === -1)
+      ? 'whole reveal — every line extended, each set’s VP. “new round” for the next box.'
+      : 'spotlit: ' + result.families[idx].label + ' — tap the row again for the whole reveal.';
+    draw();
   }
 
   var toastTimer = null;
@@ -814,6 +1293,7 @@
   /* ---- chrome wiring ---- */
   document.getElementById('btnRound').addEventListener('click', newRound);
   btnCheck.addEventListener('click', checkBox);
+  btnUndo.addEventListener('click', undoStroke);
   btnClear.addEventListener('click', clearBox);
 
   var btnHow = document.getElementById('btnHow');

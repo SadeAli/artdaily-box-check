@@ -568,19 +568,41 @@
       }
       return ((Math.atan2(sy, sx) * 90 / Math.PI) % 180 + 180) % 180;
     })();
-    var maxDev = 0;
+    var maxDev = 0, devs = [], dev;
     for (i = 0; i < segs.length; i++) {
-      maxDev = Math.max(maxDev, angleDistDeg(segs[i].angle, meanA));
+      dev = angleDistDeg(segs[i].angle, meanA);
+      devs.push(dev);
+      if (dev > maxDev) maxDev = dev;
     }
     /* two strokes prove nothing on their own — they meet *somewhere* by
        definition, and they are parallel to each other by definition too */
     var unproven = (segs.length === 2);
+    var t = tol || convergeTol(1, 150);
+    /* A PARALLEL family is not a worse answer than a converging one —
+       in two-point perspective it is the RIGHT answer, with the shared
+       point simply at infinity. So it is graded exactly like the other
+       families, on how far its members miss that shared point; toward a
+       point at infinity that miss IS the deviation from the common
+       direction. A flat 85 here hard-capped a geometrically perfect
+       two-point box — the box drawGhostIntro paints as the worked
+       example — at 95, while the row told the player "that's fine".
+       (GAME_GUIDE: a score of 100 must be possible.) */
+    var parSpread = median(devs);
+    var parScore = (parSpread <= t.freeDeg)
+      ? 100
+      : 100 * clamp(1 - (parSpread - t.freeDeg) / Math.max(1e-6, t.zeroDeg - t.freeDeg), 0, 1);
+    if (unproven) parScore = PAIR_SCORE;
+    if (!isFinite(parScore)) parScore = 0;
+    var parallel = {
+      verdict: 'parallel', score: clamp(parScore, 0, 100), vp: null,
+      spread: parSpread, unproven: unproven,
+    };
     var vp = bestFitVP(segs);
     if (!vp) {
-      return { verdict: 'parallel', score: unproven ? PAIR_SCORE : 85, vp: null, spread: 0, unproven: unproven };
+      return parallel;
     }
     if (maxDev < 4 && Math.hypot(vp.x - cx, vp.y - cy) > 8 * size) {
-      return { verdict: 'parallel', score: unproven ? PAIR_SCORE : 85, vp: null, spread: 0, unproven: unproven };
+      return parallel;
     }
     var miss = [], aim, d;
     for (i = 0; i < segs.length; i++) {
@@ -606,7 +628,6 @@
     /* full-credit plateau: inside tol.freeDeg of a shared VP is as
        tight as a human hand gets — that IS 100 (GAME_GUIDE: 100 must
        be earnable); beyond it a straight ramp to tol.zeroDeg */
-    var t = tol || convergeTol(1, 150);
     var score = (spread <= t.freeDeg)
       ? 100
       : 100 * clamp(1 - (spread - t.freeDeg) / Math.max(1e-6, t.zeroDeg - t.freeDeg), 0, 1);
@@ -1053,7 +1074,12 @@
       return { cls: 'meh', text: 'only two lines here — any two lines meet somewhere, so this set hasn’t shown anything yet. add a third and it can.' };
     }
     if (f.verdict === 'parallel') {
-      return { cls: 'meh', text: 'these run parallel — that’s fine: their meeting point is simply a very long way off' };
+      /* graded on agreement like any other set, so the wording has to
+         follow the score instead of always reading "that's fine" */
+      var rp = f.spread / Math.max(1e-6, t.zeroDeg);
+      if (rp < 0.12) return { cls: 'good', text: 'these run parallel ✓ tight — that’s fine: their meeting point is simply a very long way off' };
+      if (rp < 0.3) return { cls: 'good', text: 'these run parallel ✓ pretty clean — their meeting point is simply a very long way off' };
+      return { cls: 'meh', text: 'these run roughly parallel — their meeting point is a very long way off, but they do not quite agree on which way they go' };
     }
     if (f.crossing) {
       return { cls: 'bad', text: 'these cross over each other in the middle rather than running together — they share a point, but it is not a vanishing point. edges of one direction should only meet a long way off.' };
@@ -1499,6 +1525,12 @@
   function onUp(ev) {
     if (ev.pointerId !== activePointer) return;
     if (ev.cancelable) ev.preventDefault();
+    /* "check it" can score the box while a stroke is still in flight (a
+       second finger, or Enter). Accepting that stroke afterwards would
+       add an edge the reported score never saw — the bar, the reveal
+       and any re-analysis on resize would all disagree with the number
+       already banked. An interrupted stroke is dropped instead. */
+    if (phase !== 'draw') { onCancel(ev); return; }
     finishStroke();
   }
 
@@ -1558,6 +1590,14 @@
   function checkBox() {
     if (phase !== 'draw' || strokes.length < MIN_EDGES) return;
     phase = 'result';
+    /* let go of any stroke still in flight before the score is banked,
+       so nothing can be added to the drawing the analysis just read */
+    if (activePointer !== null) {
+      try { canvas.releasePointerCapture(activePointer); } catch (e) {}
+    }
+    live = null;
+    activePointer = null;
+    activeType = '';
     var segs = [], i;
     for (i = 0; i < strokes.length; i++) segs.push(strokes[i].seg);
     /* scoreOpts() is read BEFORE report(), so "has a previous best" is
@@ -1651,7 +1691,28 @@
   }
 
   /* ---- chrome wiring ---- */
-  document.getElementById('btnRound').addEventListener('click', newRound);
+  /* "new round" arms first when it would throw away a live round — a
+     second press within the window confirms, otherwise it snaps back.
+     A box that was never checked is never reported, so a mis-tap here
+     used to wipe eleven hand-drawn edges without a word. (The five
+     sibling drills all guard this button; this one did not.) */
+  var btnRound = document.getElementById('btnRound');
+  var roundArmTimer = null, roundArmed = false;
+  function disarmRoundBtn() {
+    roundArmed = false;
+    clearTimeout(roundArmTimer);
+    btnRound.innerHTML = 'new round <span aria-hidden="true">↻</span>';
+  }
+  btnRound.addEventListener('click', function () {
+    if (phase === 'draw' && strokes.length && !roundArmed) {
+      roundArmed = true;
+      btnRound.textContent = 'discard round?';
+      roundArmTimer = setTimeout(disarmRoundBtn, 2600);
+      return;
+    }
+    disarmRoundBtn();
+    newRound();
+  });
   btnCheck.addEventListener('click', checkBox);
   btnUndo.addEventListener('click', undoStroke);
   btnClear.addEventListener('click', clearBox);

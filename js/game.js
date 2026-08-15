@@ -1131,11 +1131,20 @@
     return 'rgb(' + out[0] + ',' + out[1] + ',' + out[2] + ')';
   }
 
+  /* Every ink is a custom property on :root, and the ONLY thing that moves
+     them is the data-theme attribute (see css/style.css) — so reading them
+     once per theme is the same answer as reading them once per repaint,
+     minus a forced style recalculation and a colour mix on every sample of
+     every stroke. An empty read (stylesheet not parsed yet) is never
+     cached, so a cold boot still corrects itself on the next frame. */
+  var inkCache = null, inkTheme = '';
   function inks() {
+    var t = ArtDaily.theme();
+    if (inkCache && inkTheme === t) return inkCache;
     var cs = getComputedStyle(document.documentElement);
     var ink = cs.getPropertyValue('--ink').trim();
     var accent = cs.getPropertyValue('--game-accent').trim() || cs.getPropertyValue('--coral').trim();
-    return {
+    var c = {
       ink: ink,
       muted: cs.getPropertyValue('--muted').trim(),
       /* Everything the game paints in the accent is meaning-bearing, so
@@ -1143,8 +1152,10 @@
          CSS: accent 55% into ink) — raw coral only reaches 3.1:1 on the
          card, this reaches 5.9:1. On the dark sheet pure accent already
          passes at 6.4:1. */
-      accentText: ArtDaily.theme() === 'dark' ? accent : mixHex(accent, ink, 0.55),
+      accentText: t === 'dark' ? accent : mixHex(accent, ink, 0.55),
     };
+    if (c.ink && c.muted) { inkCache = c; inkTheme = t; }
+    return c;
   }
 
   /* ---- crisp canvas at any devicePixelRatio; height tracks width ----
@@ -1257,8 +1268,29 @@
     draw();
   }
 
-  /* ---- painting (canvas bg stays clear so the CSS dot-grid shows) ---- */
+  /* ---- repaint scheduling ----
+     A 120Hz pen delivers several positions per dispatched event and several
+     events per displayed frame. Repainting synchronously inside each one
+     redrew every accepted edge, every dashed extension and the live stroke
+     — the whole sheet — three or four times over for one frame anybody
+     saw, and that cost grows with each edge the player adds, so the drill
+     got heavier exactly as the drawing got interesting. draw() now only
+     ASKS for a frame; paint() runs once, right before the browser
+     composites, reading the freshest stroke there is. */
+  var rafId = 0;
   function draw() {
+    if (rafId) return;
+    rafId = requestAnimationFrame(function () { rafId = 0; paint(); });
+  }
+  /* for paths that must not show a blank frame — a resize has already
+     cleared the sheet, so it repaints on the spot */
+  function paintNow() {
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    paint();
+  }
+
+  /* ---- painting (canvas bg stays clear so the CSS dot-grid shows) ---- */
+  function paint() {
     var c = inks(), i, j, pts, hi = null;
     if (result && spotlight >= 0 && result.families[spotlight]) {
       hi = {};
@@ -1471,10 +1503,14 @@
     ctx.restore();
   }
 
-  /* ---- freehand stroke capture (pointerId-guarded) ---- */
-  function pointerPos(ev) {
-    var rect = canvas.getBoundingClientRect();
-    return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+  /* ---- freehand stroke capture (pointerId-guarded) ----
+     One rect per EVENT, not one per sample: a 120Hz pen hands over a dozen
+     coalesced positions in a single dispatch, and measuring the canvas box
+     a dozen times to convert them is a dozen forced layouts for an answer
+     that cannot have changed in between. */
+  function pointerPos(ev, rect) {
+    var r = rect || canvas.getBoundingClientRect();
+    return { x: ev.clientX - r.left, y: ev.clientY - r.top };
   }
 
   /* Pen beats a simultaneous touch. Artists rest the palm BEFORE the
@@ -1518,7 +1554,8 @@
        every one of them feeds the line fit */
     var evs = (typeof ev.getCoalescedEvents === 'function') ? ev.getCoalescedEvents() : null;
     if (!evs || !evs.length) evs = [ev];
-    for (var i = 0; i < evs.length; i++) live.push(pointerPos(evs[i]));
+    var rect = canvas.getBoundingClientRect();
+    for (var i = 0; i < evs.length; i++) live.push(pointerPos(evs[i], rect));
     draw();
   });
 
@@ -1531,6 +1568,15 @@
        and any re-analysis on resize would all disagree with the number
        already banked. An interrupted stroke is dropped instead. */
     if (phase !== 'draw') { onCancel(ev); return; }
+    /* THE TAIL OF A FAST STROKE. pointerup carries a position of its own,
+       and it is the only record of where the nib actually stopped — the
+       last pointermove can be most of a frame behind it. Dropping it
+       shortened every quick, confident pull, and `seg.len` against
+       minStroke() is what decides whether a stroke is an edge at all. */
+    if (live && typeof ev.clientX === 'number') {
+      var end = pointerPos(ev), tail = live.length ? live[live.length - 1] : null;
+      if (!tail || Math.hypot(end.x - tail.x, end.y - tail.y) >= 0.5) live.push(end);
+    }
     finishStroke();
   }
 
@@ -1731,7 +1777,7 @@
     btnHow.setAttribute('aria-expanded', String(!howTo.hidden));
   });
 
-  ArtDaily.onTheme(draw);
+  ArtDaily.onTheme(function () { inkCache = null; paintNow(); });
 
   /* The hardware changed mid-session (a laptop player plugged in a
      tablet). Every tolerance in the scorer is a function of it, so a
@@ -1750,12 +1796,19 @@
     draw();
   });
 
+  /* One check per frame, not one per resize event: a dragged desktop
+     window fires these faster than the sheet can be rebuilt. */
+  var resizeRaf = 0;
   window.addEventListener('resize', function () {
-    /* height follows width, so a height-only change (an iOS toolbar
-       collapsing mid-round) must not disturb the box */
-    if (Math.abs(canvas.getBoundingClientRect().width - W) < 4) return;
-    fitCanvas();
-    draw();
+    if (resizeRaf) return;
+    resizeRaf = requestAnimationFrame(function () {
+      resizeRaf = 0;
+      /* height follows width, so a height-only change (an iOS toolbar
+         collapsing mid-round) must not disturb the box */
+      if (Math.abs(canvas.getBoundingClientRect().width - W) < 4) return;
+      fitCanvas();
+      paintNow();   /* fitCanvas already blanked the sheet — no empty frame */
+    });
   });
 
   /* ---- boot ---- */

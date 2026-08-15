@@ -4,16 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Box Check — Art Daily</title>
-<meta name="description" content="draw a box, get a convergence critique — a daily art drill from artdaily.sadeali.com">
+<meta name="description" content="draw a box and see where your edges really point — a daily art drill from artdaily.sadeali.com">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Box Check">
-<meta property="og:description" content="draw a box, get a convergence critique — a daily art drill">
+<meta property="og:description" content="draw a box and see where your edges really point — a daily art drill">
 <meta property="og:site_name" content="Art Daily · SadeAli">
 <meta property="og:url" content="https://sadeali.github.io/artdaily-box-check/">
 <link rel="canonical" href="https://sadeali.github.io/artdaily-box-check/">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="Box Check">
-<meta name="twitter:description" content="draw a box, get a convergence critique — a daily art drill">
+<meta name="twitter:description" content="draw a box and see where your edges really point — a daily art drill">
 <link rel="icon" href="data:image/svg+xml,&lt;svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'&gt;&lt;text y='.9em' font-size='90'&gt;📦&lt;/text&gt;&lt;/svg&gt;">
 <link rel="stylesheet" href="css/style.css">
 <script>
@@ -37,12 +37,13 @@
       <div class="game-hud">
         <div class="game-id">
           <h1 class="game-name"><span class="game-emoji" aria-hidden="true">📦</span> Box Check</h1>
-          <p class="game-tagline">draw a box, get a convergence critique</p>
+          <p class="game-tagline">draw a box — see where your edges really point</p>
         </div>
         <dl class="hud-stats">
           <div class="hud-stat"><dt>round</dt><dd id="hudRound">–</dd></div>
           <div class="hud-stat"><dt>score</dt><dd id="hudScore">–</dd></div>
           <div class="hud-stat"><dt>best</dt><dd id="hudBest">–</dd></div>
+                <div class="hud-stat hud-input"><dd id="inputMode" hidden></dd></div>
         </dl>
       </div>
 
@@ -66,10 +67,12 @@
       </div>
       <div class="howto" id="howTo" hidden>
         <p class="howto-cmd" aria-hidden="true"><span class="prompt">$</span> man box-check</p>
-        <p>Freehand a 3D box, one straight stroke per edge — 6 edges minimum, a full box is 9–12 — then hit “check it”. “Undo” takes back the last stroke; “clear” starts the box over without spending the round.</p>
-        <p>Your strokes are sorted into the three edge directions and each is scored on convergence: a tight vanishing point scores high, parallel is fine (85), diverging is the classic mistake (caps at 30).</p>
-        <p>After checking, tap any critique row to spotlight just that set on the sheet. The dashed ghost is the true box the maths fitted to your best two vanishing points — the shape you were reaching for.</p>
-        <p>Studio tip: check yourself the way Drawabox does — extend every line after you draw it. Converging slightly beats parallel; diverging is never right.</p>
+        <p>Freehand a 3D box, one straight stroke per edge — 6 edges minimum, a full box is 9–12 — then hit “check it”. Lift between edges; that is how this one is meant to be drawn. “Undo” takes back the last stroke; “clear” starts the box over without spending the round.</p>
+        <p><strong>What a vanishing point is.</strong> Every edge you draw is extended past its ends the moment you finish it — watch where those extensions go. Edges that run the same way in 3D all point at one shared spot on the page: that spot is their vanishing point. A box has edges going three ways, so it has three of them.</p>
+        <p>Checking sorts your strokes into those three sets and asks of each: do these really aim at one point? Tight agreement scores high. Parallel is fine — it just means the point is a very long way off. Edges that spread apart as they go back are the classic mistake, because going away from you they should be closing in.</p>
+        <p>Tap any row of the critique to show just that set on the sheet. The dashed ghost is a true box worked out from your two best sets — the shape you were reaching for.</p>
+        <p>How much wobble is allowed depends on what you are drawing with and how big your box is — a short edge turns the same hand tremor into a much bigger angle. The HUD says which input it scored for, and your score is only ever compared with your own.</p>
+        <p>Studio tip: after every single line you draw, extend it and look at where it points. That habit is the whole exercise.</p>
       </div>
 
       <noscript><p class="hint">This drill needs JavaScript — nothing else, no trackers, no accounts.</p></noscript>

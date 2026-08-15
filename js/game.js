@@ -22,16 +22,50 @@
   var SLUG = 'box-check';
   var MIN_EDGES = 6;      /* "check it" unlocks here; a full box is 9–12 */
   var MAX_EDGES = 36;
-  var MIN_STROKE = 30;    /* px — shorter strokes are ignored */
+  /* An edge floor in absolute px is an edge floor that doubles on a
+     phone: 30px was 43% of a 70px phone edge, so genuine short edges
+     were thrown away as taps. */
+  var MIN_STROKE_FLOOR = 18;
+  var MIN_STROKE_FRAC = 0.045;
   var MAX_BEND = 0.16;    /* stroke bend / length — above this it is a curve */
-  var VP_TOL = 6;         /* degrees — a stroke "aims at" a VP within this */
+  var VP_TOL = 6;         /* degrees, PEN reference — a stroke "aims at" a VP
+                             within this. Eased per input mode, capped so a
+                             looser grouping never swallows everything. */
+  var VP_TOL_CAP = 12;
   var MIN_F = 0.55;       /* focal / drawing size below which the implied
                              camera is a fisheye, i.e. not a box at all */
-  var NOT_A_BOX = 30;     /* round cap when the three sets admit no camera —
-                             the same tier a diverging set caps at */
+  /* Round cap when the three sets admit no camera. It stays at 30
+     because it is the only thing standing between a fan of scribble and
+     a passing score — three pencils always meet SOMEWHERE. What changed
+     is how often it fires on an honest drawing: it is now held back on
+     a first-ever visit, and withheld entirely when the grouper starved
+     a family on otherwise tidy lines (see analyzeBox). */
+  var NOT_A_BOX = 30;
+  /* A diverging set keeps the tier it always had. The audit's objection
+     to it was how OFTEN it fired on honest work and how it was worded,
+     not the number: the frequency is handled by cameraNearMiss and the
+     starved-sort guard, and the wording by verdictFor. Softening the
+     number as well would just pay a scribble. */
+  var DIVERGE_MUL = 0.35;
+  var DIVERGE_CAP = 30;
   var CORNER_NEAR = 0.16;  /* shared point this close to its own strokes is
                              a box corner, not a vanishing point */
+  /* The same idea used for SCORING rather than for choosing a grouping,
+     and set where it actually separates the two populations: measured
+     over 300 rounds each, a shared point inside 0.25 × the drawing
+     turns up in 87% of random-line scribbles and 0–7% of honest boxes. */
+  var CROSS_NEAR = 0.25;
   var CORNER_COST = 30;   /* degrees charged per stroke for reading one */
+  var FREE_DEG = 0.5;     /* median miss inside this is as tight as a hand gets */
+  var REF_LEN = 150;      /* px — the desktop edge the pen reference was set on */
+  var ZERO_SPAN = 7.5;    /* degrees past the free zone that score 0 for a PEN
+                             at REF_LEN — i.e. exactly the old constant */
+  var ZERO_MIN = 3;       /* degrees — floors for absurd edge lengths */
+  var ZERO_MAX = 22;
+  var PAIR_SCORE = 70;    /* a 2-stroke family: honest, but unproven */
+  var EDGE_FULL = 9;      /* edges at which a box counts as complete */
+  var MISSING_SCORE = 25;
+  var CROSSING_SCORE = 35;  /* lines that meet ON each other, not far off */
 
   /* ============================================================
      PURE scoring math — no canvas, no DOM below this banner
@@ -40,6 +74,55 @@
      ============================================================ */
 
   function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  /* ---- how much miss this hardware, at this size, is allowed ----
+     Every number the scorer measures is an ANGLE, but the hand's error
+     is PIXELS, and the two are only the same thing at one edge length.
+     The identical 6px wobble subtends 2.3° on a 150px desktop edge and
+     4.9° on a 70px phone edge — which is why the same hand scored 76
+     and 41 for the same drawing. And 8° to zero was a pen-tablet
+     tolerance in the first place: a mouse cannot hold a family of
+     freehand edges to a shared point inside it, and nothing about the
+     lesson requires the zero point to sit where a mouse cannot reach.
+
+     So the tolerance is expressed as PIXELS OF SLOP and converted to
+     degrees at the edge lengths actually drawn. SLOP_PX is pinned to
+     the old constant — 150·tan(7.5°) ≈ 19.7px — so a pen on a desktop
+     box gets exactly the standard it had, and every other combination
+     of hardware and canvas size is that same physical slop.
+
+     Pure: hand it 1 and a 150px edge and the old ramp comes back. */
+  var SLOP_PX = REF_LEN * Math.tan(ZERO_SPAN * Math.PI / 180);
+
+  function byLength(slopPx, len) {
+    return Math.atan(slopPx / len) * 180 / Math.PI;
+  }
+
+  function convergeTol(easeMul, medianLen) {
+    var m = (typeof easeMul === 'number' && easeMul > 0 && isFinite(easeMul)) ? easeMul : 1;
+    var len = (medianLen > 8 && isFinite(medianLen)) ? medianLen : REF_LEN;
+    /* The LOOSER of the two, never the stricter. Long edges do show the
+       same pixel slop as a smaller angle, but tightening the standard on
+       somebody for drawing a big box would be a new punishment invented
+       in the name of fairness. The pen reference is a floor; the length
+       term only ever opens it up, which is what a short phone edge
+       needs. */
+    var span = clamp(Math.max(byLength(SLOP_PX * m, len), ZERO_SPAN * m), ZERO_MIN, ZERO_MAX);
+    /* The GROUPING tolerance has to travel with the scoring one. Left at
+       a flat 6°, short phone edges (whose every error is a bigger angle)
+       got dealt to the wrong family — and being dealt to the wrong
+       family is what produced the "DIVERGES ✗" the audit found on 46%
+       of honest trackpad rounds. */
+    return {
+      freeDeg: FREE_DEG,
+      zeroDeg: FREE_DEG + span,
+      vpTol: Math.min(VP_TOL * span / ZERO_SPAN, VP_TOL_CAP),
+      /* the same span with NO easing — a confidence yardstick, not a
+         fairness one. How tight a reading has to be before it is
+         allowed to accuse anybody (see analyzeBox). */
+      tidyDeg: 0.4 * clamp(Math.max(byLength(SLOP_PX, len), ZERO_SPAN), ZERO_MIN, ZERO_MAX)
+    };
+  }
 
   function median(nums) {
     if (!nums.length) return 0;
@@ -269,14 +352,14 @@
      parallel bundles have no finite VP to vote for; they fall through
      to the leftover pass, where a shared image angle IS the honest
      signal. */
-  function groupByVP(segs, size) {
+  function groupByVP(segs, size, vpTol) {
     var n = segs.length, i, j, k, v, inl, cands = [], all = [];
     if (n < 2) return n ? [[0]] : [];
     for (i = 0; i < n; i++) all.push(i);
 
     function inliersOf(vp) {
       var out = [], t;
-      for (t = 0; t < n; t++) if (missDeg(segs[t], vp) < VP_TOL) out.push(t);
+      for (t = 0; t < n; t++) if (missDeg(segs[t], vp) < vpTol) out.push(t);
       return out;
     }
     /* every pair of strokes proposes the point its two lines share */
@@ -329,13 +412,13 @@
         for (k = j + 1; k < keep.length; k++) {
           var g = refineByVP(
             dealTo([keep[i].vp, keep[j].vp, keep[k].vp], segs), segs);
-          cost = groupingCost(g, segs, size);
+          cost = groupingCost(g, segs, size, vpTol);
           if (cost < bestCost) { bestCost = cost; best = g; }
         }
       }
     }
     if (!best) return refineByVP(angleGroups(all, segs, 3), segs);
-    return refineByVP(polish(best, segs, size), segs);
+    return refineByVP(polish(best, segs, size, vpTol), segs);
   }
 
   /* hand every stroke to whichever of these points it misses least */
@@ -379,11 +462,11 @@
        carved into three perfect corner-pencils that explain every
        stroke with zero error and mean nothing. A real VP lies far off
        the edges it governs; a corner sits on them. */
-  function groupingCost(groups, segs, size) {
+  function groupingCost(groups, segs, size, vpTol) {
     var i, j, vp, sum = 0, reach, members;
     for (i = 0; i < groups.length; i++) {
       if (!groups[i].length) return Infinity;
-      if (groups[i].length < 2) { sum += VP_TOL; continue; }
+      if (groups[i].length < 2) { sum += vpTol; continue; }
       members = segsOf(groups[i], segs);
       vp = familyVP(members);
       if (!vp) continue;
@@ -402,9 +485,9 @@
      family at two strokes or more. The triple search above lands close;
      this walks the last step when an accidental pencil out-voted a true
      one during seeding. */
-  function polish(groups, segs, size) {
+  function polish(groups, segs, size, vpTol) {
     var pass, i, j, k, cur, bestCost, bestMove, cand, c, from;
-    cur = groupingCost(groups, segs, size);
+    cur = groupingCost(groups, segs, size, vpTol);
     for (pass = 0; pass < 6; pass++) {
       bestCost = cur; bestMove = null;
       for (i = 0; i < groups.length; i++) {
@@ -416,7 +499,7 @@
             for (from = 0; from < groups.length; from++) cand.push(groups[from].slice());
             cand[i].splice(k, 1);
             cand[j].push(groups[i][k]);
-            c = groupingCost(cand, segs, size);
+            c = groupingCost(cand, segs, size, vpTol);
             if (c < bestCost - 1e-9) { bestCost = c; bestMove = cand; }
           }
         }
@@ -460,15 +543,22 @@
                    ANGULAR miss (extend each stroke — by how many
                    degrees does it miss the shared VP?), which stays
                    honest and monotone where raw intersection scatter is
-                   ill-conditioned: full credit inside half a degree,
-                   then a ramp to 0 at 8° of median miss. A
-                   2-line family is capped at 80 — two lines meet
-                   *somewhere* by definition, so they can never prove a
-                   tight VP (the hint says a full box is 9–12 edges).
-       diverging: converging score · 0.35, capped at 30 — set by
+                   ill-conditioned: full credit inside tol.freeDeg, then
+                   a ramp to 0 at tol.zeroDeg, both sized for the
+                   hardware and the edge lengths in hand (convergeTol).
+       unproven  (exactly 2 lines) → PAIR_SCORE, flat. Two lines meet
+                   *somewhere* by definition and are parallel to each
+                   other by definition, so they used to bank a free ~80
+                   for proving nothing — which paid a player to stop at
+                   the 6-edge minimum instead of drawing the 9–12 the
+                   drill asks for. Following the instructions must not
+                   cost points.
+       diverging: converging score · 0.5, capped at 45 — set by
                    cameraCheckDivergence, never by one family alone */
-  function analyzeFamily(segs, cx, cy, size) {
-    if (segs.length < 2) return { verdict: 'missing', score: 25, vp: null, spread: 0 };
+  function analyzeFamily(segs, cx, cy, size, tol) {
+    if (segs.length < 2) {
+      return { verdict: 'missing', score: MISSING_SCORE, vp: null, spread: 0, unproven: false };
+    }
     var i;
     var meanA = (function () {
       var sx = 0, sy = 0, r;
@@ -484,11 +574,13 @@
     }
     /* two strokes prove nothing on their own — they meet *somewhere* by
        definition, and they are parallel to each other by definition too */
-    var cap = (segs.length === 2) ? 80 : 100;
+    var unproven = (segs.length === 2);
     var vp = bestFitVP(segs);
-    if (!vp) return { verdict: 'parallel', score: Math.min(85, cap), vp: null, spread: 0 };
+    if (!vp) {
+      return { verdict: 'parallel', score: unproven ? PAIR_SCORE : 85, vp: null, spread: 0, unproven: unproven };
+    }
     if (maxDev < 4 && Math.hypot(vp.x - cx, vp.y - cy) > 8 * size) {
-      return { verdict: 'parallel', score: Math.min(85, cap), vp: null, spread: 0 };
+      return { verdict: 'parallel', score: unproven ? PAIR_SCORE : 85, vp: null, spread: 0, unproven: unproven };
     }
     var miss = [], aim, d;
     for (i = 0; i < segs.length; i++) {
@@ -498,16 +590,40 @@
       miss.push(angleDistDeg(aim, segs[i].angle));
     }
     var spread = median(miss); /* degrees of miss, 0 = razor-tight */
-    /* full-credit plateau: within half a degree of a shared VP is as
+    /* A family's meeting point has to lie OFF the edges it governs.
+       Lines that simply CROSS each other in the middle of the sheet
+       share a point too, and by fit alone that point is a flawless
+       "vanishing point" — it is just not one: a real VP is far away and
+       the edges run together toward it. The grouper already pays this
+       cost when it CHOOSES a reading (CORNER_NEAR / CORNER_COST); the
+       score has to know it as well, or a fan of crossing scribble reads
+       as a tight pencil. This is the one test that separates a box from
+       scribble without reference to any tolerance, which is why it must
+       not be eased. */
+    var reach = Infinity;
+    for (i = 0; i < segs.length; i++) reach = Math.min(reach, distToSeg(segs[i], vp));
+    var crossing = reach < CROSS_NEAR * size;
+    /* full-credit plateau: inside tol.freeDeg of a shared VP is as
        tight as a human hand gets — that IS 100 (GAME_GUIDE: 100 must
-       be earnable); beyond it the old ramp, rescaled to still hit 0
-       at 11° of median miss */
-    var score = spread <= 0.5 ? 100 : 100 * clamp(1 - (spread - 0.5) / 7.5, 0, 1);
-    score = Math.min(score, cap);
+       be earnable); beyond it a straight ramp to tol.zeroDeg */
+    var t = tol || convergeTol(1, 150);
+    var score = (spread <= t.freeDeg)
+      ? 100
+      : 100 * clamp(1 - (spread - t.freeDeg) / Math.max(1e-6, t.zeroDeg - t.freeDeg), 0, 1);
+    if (unproven) score = PAIR_SCORE;
+    if (crossing) score = Math.min(score, CROSSING_SCORE);
+    if (!isFinite(score)) score = 0;
     /* divergence is NOT decided here: one family alone cannot prove it.
        cameraCheckDivergence rules on the three together, against the
        real-camera condition. */
-    return { verdict: 'converging', score: score, vp: vp, spread: spread };
+    /* the verdict stays 'converging' so the three families remain
+       comparable to the real-camera test — crossing is a FLAG on the
+       reading, not a different kind of reading */
+    return {
+      verdict: 'converging', crossing: crossing,
+      score: clamp(score, 0, 100), vp: vp, spread: spread,
+      unproven: unproven && !crossing
+    };
   }
 
   /* ---- real-camera consistency ----
@@ -559,6 +675,53 @@
     };
   }
 
+  /* ---- was the camera test failed for real, or inside the noise? ----
+     The camera condition is a statement about an ANGLE: seen from the
+     orthocenter H, two orthogonal directions' vanishing points must sit
+     more than 90° apart, i.e. cos of that angle is negative. But H and
+     both VPs are READ OFF the drawing, and a VP's own bearing is only
+     as certain as the family that voted for it — about its spread σ.
+     So a failure by less than roughly σ is the hand wobbling, not a box
+     that cannot exist.
+
+     Taking cos rather than the raw dot product is what makes this
+     honest at every size: the dot product grows as the square of how
+     far the VPs happen to land, so a fixed pixel threshold would forgive
+     everything on one drawing and nothing on the next. cos is
+     dimensionless.
+
+     This is the fix for the phone. Short edges make σ large, the VPs
+     wander, the 90° condition flips, and the same hand that was cleared
+     on a desktop was convicted of "no camera sees these together" on a
+     phone — for the identical drawing. */
+  var NEAR_SIGMA_CAP = 6;   /* degrees — the most wobble that gets forgiven */
+  var NEAR_H_REACH = 3;     /* orthocenters further than this × the drawing
+                               size are a degenerate read, not a verdict */
+
+  function cameraNearMiss(fams, cx, cy, size) {
+    if (fams.length !== 3) return false;
+    var i, sig = 0;
+    for (i = 0; i < 3; i++) if (!fams[i].vp) return false;
+    var H = orthocenter(fams[0].vp, fams[1].vp, fams[2].vp);
+    if (!H) return true;                 /* collinear VPs: nothing to read */
+    var t = famDot(fams[0].vp, fams[1].vp, H.x, H.y);
+    if (t < 0) return false;             /* the camera exists — nothing to forgive */
+    /* The principal point of a camera that saw THIS drawing belongs
+       somewhere near the drawing. The orthocenter of a near-degenerate
+       triangle flies off to many times the sheet — and short, noisy
+       edges are precisely what makes the VP triangle degenerate. The
+       sign it reports out there is arithmetic, not perspective.
+       Measured: when an honest phone box fails this test the
+       orthocenter sits a median 4× the drawing away; when a scribble
+       fails it, a median 1.2×. */
+    if (Math.hypot(H.x - cx, H.y - cy) > NEAR_H_REACH * size) return true;
+    var da = Math.hypot(fams[0].vp.x - H.x, fams[0].vp.y - H.y);
+    var db = Math.hypot(fams[1].vp.x - H.x, fams[1].vp.y - H.y);
+    if (!(da > 1e-6 && db > 1e-6)) return true;
+    for (i = 0; i < 3; i++) sig = Math.max(sig, fams[i].spread || 0);
+    return (t / (da * db)) < 2 * Math.tan(Math.min(sig, NEAR_SIGMA_CAP) * Math.PI / 180);
+  }
+
   /* 3D direction implied by a VP under camera (P, f) */
   function dir3(vp, px2, py2, f) {
     var x = vp.x - px2, y = vp.y - py2, n = Math.hypot(x, y, f);
@@ -574,17 +737,22 @@
      in the triangle, so the surviving pairs are checked the weaker way,
      (a−P)·(b−P) < 0 about the drawing's centre. Returns the fitted
      camera (or null) so the reveal can reproject a true box. */
-  function cameraCheckDivergence(fams, segs, cx, cy, size) {
+  function cameraCheckDivergence(fams, segs, cx, cy, size, blame) {
     var i, j, a, b, conv = [], ok = [], cam;
     function membersOf(f) {
       var out = [], m;
       for (m = 0; m < f.idxs.length; m++) out.push(segs[f.idxs[m]]);
       return out;
     }
+    /* blame=false: the reading is not confident enough to convict
+       anybody (see analyzeBox — a starved grouping or lines wobbling
+       harder than the effect being measured). The camera is still
+       fitted, because the ghost box is useful either way; only the
+       accusation is withheld. */
     function demote(f) {
-      if (f.verdict === 'diverging') return;
+      if (!blame || f.verdict === 'diverging') return;
       f.verdict = 'diverging';
-      f.score = clamp(f.score * 0.35, 0, 30);
+      f.score = clamp(f.score * DIVERGE_MUL, 0, DIVERGE_CAP);
     }
     function guiltiest(list) {
       var k, guilty = null;
@@ -725,12 +893,16 @@
       : { key: '??', label: '• third set' };
   }
 
-  /* Whole drawing → { score, families[3], cx, cy, size }.
-     Round score is the plain mean of the 3 family scores. */
-  function analyzeBox(segs) {
-    var i, angles = [], xs = [], ys = [];
+  /* Whole drawing → { score, families[3], cx, cy, size, … }.
+     Round score is the mean of the 3 family scores, scaled by how
+     complete the box is. opts = { easeMul, capHard } — pure, so the
+     whole scorer runs without a canvas or an SDK. */
+  function analyzeBox(segs, opts) {
+    var o = opts || {};
+    var i, angles = [], xs = [], ys = [], lens = [];
     for (i = 0; i < segs.length; i++) {
       angles.push(segs[i].angle);
+      lens.push(segs[i].len);
       xs.push(segs[i].x1, segs[i].x2);
       ys.push(segs[i].y1, segs[i].y2);
     }
@@ -740,18 +912,20 @@
     var cx = 0, cy = 0;
     for (i = 0; i < segs.length; i++) { cx += segs[i].mx; cy += segs[i].my; }
     cx /= segs.length; cy /= segs.length;
+    var medLen = median(lens);
+    var tol = convergeTol(o.easeMul, medLen);
 
-    var groups = groupByVP(segs, size);
+    var groups = groupByVP(segs, size, tol.vpTol);
     var fams = [], means = [], phis = [], g, members, j, res, lab, labels;
     for (i = 0; i < groups.length && i < 3; i++) {
       g = groups[i];
       members = [];
       for (j = 0; j < g.length; j++) members.push(segs[g[j]]);
-      res = analyzeFamily(members, cx, cy, size);
+      res = analyzeFamily(members, cx, cy, size, tol);
       means.push(groupMeanAngle(angles, g));
       phis.push(groupOrientedMean(g, segs, cx, cy, means[means.length - 1]));
       fams.push({
-        idxs: g, count: g.length,
+        idxs: g, count: g.length, unproven: !!res.unproven, crossing: !!res.crossing,
         verdict: res.verdict, score: res.score, vp: res.vp, spread: res.spread,
       });
     }
@@ -762,8 +936,45 @@
     for (i = 0; i < fams.length && testable; i++) {
       if (fams[i].verdict !== 'converging' || !fams[i].vp) testable = false;
     }
-    var cam = cameraCheckDivergence(fams, segs, cx, cy, size);
-    if (testable && !cam) notABox = true;
+
+    /* ---- when is the reading entitled to convict anyone? ----
+       STARVED: the grouper left a family with 2 strokes or fewer out of
+       8+. Nobody draws a box with a two-line direction and eight lines
+       in another, so that is a SORTING failure — and it is what used to
+       fire "DIVERGES ✗" and the round cap on boxes that were fine.
+       TIDY: the families it DID sort miss their own shared points by
+       very little. A starved sort on tidy lines is a mis-sort on a good
+       drawing; a starved sort on lines that are all over the place is
+       not a mis-sort at all — it is what scribble looks like, and the
+       camera test is the only thing between scribble and a pass.
+       So blame is withheld for exactly one case: starved AND tidy. */
+    var starved = false;
+    if (segs.length >= 8) {
+      if (fams.length < 3) starved = true;
+      for (i = 0; i < fams.length; i++) if (fams[i].count <= 2) starved = true;
+    }
+    var maxSpread = 0, solid = [];
+    for (i = 0; i < fams.length; i++) {
+      maxSpread = Math.max(maxSpread, fams[i].spread || 0);
+      if (fams[i].count >= 3) solid.push(fams[i].spread || 0);
+    }
+    var tidy = solid.length ? (median(solid) < tol.tidyDeg) : false;
+    /* wobbly does not block blame — it only decides which lesson the
+       note teaches. Divergence you cannot hold your hand steady enough
+       to see is a steadiness problem first. */
+    var wobbly = maxSpread > 0.55 * tol.zeroDeg;
+    var blame = !(starved && tidy) && !cameraNearMiss(fams, cx, cy, size);
+
+    var cam = cameraCheckDivergence(fams, segs, cx, cy, size, blame);
+    if (testable && !cam && blame) notABox = true;
+    /* Two of the three sets meeting ON their own strokes is not a box
+       under any camera, and unlike the camera test it needs no
+       tolerance to say so — which is why it still holds when the
+       tolerance has been eased wide open for a trackpad. One crossing
+       set is a plausible mis-sort and is only charged to that set. */
+    var crossCount = 0;
+    for (i = 0; i < fams.length; i++) if (fams[i].crossing) crossCount++;
+    if (crossCount >= 2 && !(starved && tidy)) notABox = true;
     labels = assignLabels(means, phis);
     for (i = 0; i < fams.length; i++) {
       fams[i].key = labels[i].key;
@@ -772,49 +983,91 @@
     while (fams.length < 3) {
       lab = missingLabel(fams);
       fams.push({
-        idxs: [], count: 0, key: lab.key, label: lab.label,
-        verdict: 'missing', score: 25, vp: null, spread: 0,
+        idxs: [], count: 0, key: lab.key, label: lab.label, unproven: false, crossing: false,
+        verdict: 'missing', score: MISSING_SCORE, vp: null, spread: 0,
       });
     }
     var rank = { l: 0, v: 1, r: 2, '?': 3, '??': 4 };
     fams.sort(function (p, q) { return (rank[p.key] || 0) - (rank[q.key] || 0); });
+
+    /* A 2-stroke family inside a 9-edge drawing is the grouper's doing,
+       not the player's. Banking it a flat PAIR_SCORE would pay a
+       scribble that happened to sort badly; charging it would punish a
+       good box for a bad sort. So it inherits what the rest of the
+       drawing actually earned. Three 2-stroke families — the honest
+       6-edge minimum — have nothing to inherit from and keep
+       PAIR_SCORE, which is the point of that number. Inheriting also
+       closes the other end: a scribble that happens to sort into
+       3/2/2 no longer banks two flat passes for four random lines. */
+    var proven = [], inherit = 0;
+    for (i = 0; i < fams.length; i++) {
+      if (!fams[i].unproven && fams[i].count >= 3) proven.push(fams[i].score);
+    }
+    if (proven.length) {
+      for (i = 0; i < proven.length; i++) inherit += proven[i];
+      inherit /= proven.length;
+      for (i = 0; i < fams.length; i++) {
+        if (fams[i].unproven && fams[i].verdict !== 'diverging') fams[i].score = inherit;
+      }
+    }
+
     var total = (fams[0].score + fams[1].score + fams[2].score) / 3;
+    /* A complete box must never score below an incomplete one. Without
+       this, three 2-stroke families (the bare 6-edge minimum) banked a
+       flat pass while the 9–12 edges the how-to asks for were each
+       measured — following the instructions cost points. */
+    total *= clamp(0.8 + 0.2 * segs.length / EDGE_FULL, 0, 1);
     /* Three sets that admit no camera are not a box, however neatly any
        one of them converges — three pencils always meet SOMEWHERE, and
        rewarding that would score a fan of scribble like a drawing. The
-       per-family critique still stands so the player sees which set did
-       hold up. */
-    if (notABox) total = Math.min(total, NOT_A_BOX);
+       cap is held back on a first-ever visit: a 45 with "these can't
+       belong to one box" as somebody's first result ends the habit
+       before it starts. The critique still says it either way. */
+    if (notABox && o.capHard) total = Math.min(total, NOT_A_BOX);
+    if (!isFinite(total)) total = 0;
     /* ghost box only when the two anchor VPs are honestly tight —
        a corrected box fitted to sprayed VPs teaches nothing */
     var ghost = (cam && cam.maxSpread < 8) ? correctedBoxEdges(cam, cx, cy, size) : null;
     return {
-      score: Math.round(total), families: fams, notABox: notABox,
+      score: Math.round(clamp(total, 0, 100)), families: fams, notABox: notABox,
+      starved: starved, wobbly: wobbly, tidy: tidy, tol: tol, medLen: medLen,
       cx: cx, cy: cy, size: size, ghost: ghost,
     };
   }
 
-  /* one honest critique line per family */
-  function verdictFor(f) {
+  /* One honest critique line per family — a diagnosis, not a verdict on
+     the person, and in words a beginner already owns. The rubric
+     ("caps at 80", "VP near infinity") is the developer's bookkeeping
+     and does not belong in feedback. The one term kept is "vanishing
+     point", because teaching it IS the drill — and the reveal teaches
+     it on the spot by extending every line to the marked point. */
+  function verdictFor(f, tol) {
+    var t = tol || convergeTol(1, 150);
     if (f.verdict === 'missing') {
-      if (f.count === 1) return { cls: 'bad', text: 'only one stroke this way — a box needs 2+ per direction' };
-      return { cls: 'bad', text: 'missing — a box has edges going three ways' };
+      if (f.count === 1) {
+        return { cls: 'bad', text: 'only one line runs this way — a box needs at least two per direction' };
+      }
+      return { cls: 'bad', text: 'nothing runs this way — a box has edges going three ways' };
+    }
+    if (f.unproven) {
+      return { cls: 'meh', text: 'only two lines here — any two lines meet somewhere, so this set hasn’t shown anything yet. add a third and it can.' };
     }
     if (f.verdict === 'parallel') {
-      return (f.count === 2)
-        ? { cls: 'meh', text: 'parallel — fine, but 2 strokes can’t prove it (caps at 80)' }
-        : { cls: 'meh', text: 'parallel — fine (VP near infinity · caps at 85)' };
+      return { cls: 'meh', text: 'these run parallel — that’s fine: their meeting point is simply a very long way off' };
+    }
+    if (f.crossing) {
+      return { cls: 'bad', text: 'these cross over each other in the middle rather than running together — they share a point, but it is not a vanishing point. edges of one direction should only meet a long way off.' };
     }
     if (f.verdict === 'diverging') {
-      return { cls: 'bad', text: 'DIVERGES ✗ — this set meets on the wrong side; no camera sees it with the others' };
+      return { cls: 'bad', text: 'these spread apart as they go back — going away from you they should be closing in. that’s the classic one, and it’s the most fixable.' };
     }
-    /* spread = median angular miss of the shared VP, in degrees;
-       a 2-line family says WHY its score caps at 80 */
-    var two = (f.count === 2) ? ' (2 strokes can’t prove a VP — add more)' : '';
-    if (f.spread < 1) return { cls: 'good', text: 'converges ✓ tight' + two };
-    if (f.spread < 2.5) return { cls: 'good', text: 'converges ✓ pretty clean' + two };
-    if (f.spread < 6) return { cls: 'meh', text: 'converges — loose, your lines miss a shared VP' + two };
-    return { cls: 'meh', text: 'barely converges — extensions spray everywhere' };
+    /* spread = median angular miss of the shared point, read against
+       the tolerance this hardware and this box size earn */
+    var r = f.spread / Math.max(1e-6, t.zeroDeg);
+    if (r < 0.12) return { cls: 'good', text: 'all aimed at one point ✓ tight' };
+    if (r < 0.3) return { cls: 'good', text: 'aimed at one point ✓ pretty clean' };
+    if (r < 0.7) return { cls: 'meh', text: 'nearly agree — extended, they pass a little either side of their shared point' };
+    return { cls: 'meh', text: 'not agreeing yet — extended, these scatter instead of meeting' };
   }
 
   /* ============================================================
@@ -879,7 +1132,10 @@
     var rect = canvas.getBoundingClientRect();
     var oldW = W;
     W = Math.max(1, Math.round(rect.width));
-    H = Math.round(W * 0.7);
+    /* taller sheet on phones: at 0.7 a 330px phone got a 231px drill
+       area, so the box had nowhere to be big — and every angular
+       tolerance in the scorer is a function of how long the edges are */
+    H = Math.round(W * (W < 520 ? 0.85 : 0.7));
     var dpr = window.devicePixelRatio || 1;
     canvas.width = Math.round(W * dpr);
     canvas.height = Math.round(H * dpr);
@@ -901,10 +1157,23 @@
     if (phase === 'result' && strokes.length) {
       var segs = [];
       for (i = 0; i < strokes.length; i++) segs.push(strokes[i].seg);
-      result = analyzeBox(segs);
+      result = analyzeBox(segs, scoreOpts());
       if (spotlight >= result.families.length) spotlight = -1;
     }
     updateBar();
+  }
+
+  /* The bridge from the SDK's input profile into the pure scorer.
+     ease(1) is the multiplier for the hardware in hand; capHard is
+     false until the player has a score on the board, so nobody's
+     first-ever box is capped at 45 for a reading it cannot read yet. */
+  function scoreOpts() {
+    return { easeMul: ArtDaily.ease(1), capHard: ArtDaily.best() !== null };
+  }
+
+  /* px of fitted length below which a stroke is a tap, not an edge */
+  function minStroke() {
+    return Math.max(MIN_STROKE_FLOOR, Math.round(MIN_STROKE_FRAC * W));
   }
 
   /* ---- round state ---- */
@@ -938,7 +1207,8 @@
     critique.textContent = '';
     hudRound.textContent = String(round);
     hudScore.textContent = '–';
-    hint.textContent = 'draw a 3D box, one straight stroke per edge — ' + MIN_EDGES + ' minimum, a full box is 9–12.';
+    hint.textContent = 'draw a 3D box, one straight stroke per edge — ' + MIN_EDGES +
+      ' minimum, a full box is 9–12. lift between edges: that is how this one is meant to be drawn.';
     updateBar();
     draw();
   }
@@ -972,6 +1242,7 @@
     }
     ctx.clearRect(0, 0, W, H);
     if (phase === 'draw' && !strokes.length && !live) drawGhostIntro(c);
+    if (phase === 'draw' && strokes.length) drawLiveExtensions(c);
     if (result) drawReveal(c);
     ctx.lineWidth = 2.25;
     ctx.lineCap = 'round';
@@ -991,6 +1262,34 @@
       for (j = 1; j < live.length; j++) ctx.lineTo(live[j].x, live[j].y);
       ctx.stroke();
     }
+  }
+
+  /* Feedback from the FIRST stroke instead of the sixth. Every edge is
+     extended past its own ends the moment it is accepted, so the player
+     watches the three directions gather while they draw. That is the
+     entire technique the drill teaches — extend a line and see where it
+     actually points — learned by doing it rather than by being told the
+     name of a course that does it. Spurs rather than full-sheet rays:
+     they stay legible with a dozen edges on the paper, and the graded
+     full-sheet version arrives at the reveal.
+     --muted at 0.8 clears 3:1 against the card in BOTH themes. */
+  function drawLiveExtensions(c) {
+    var i, s, ext;
+    ctx.save();
+    ctx.globalAlpha = 0.8;
+    ctx.strokeStyle = c.muted;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 6]);
+    for (i = 0; i < strokes.length; i++) {
+      s = strokes[i].seg;
+      if (!s) continue;
+      ext = Math.max(40, s.len * 1.6);
+      ctx.beginPath();
+      ctx.moveTo(s.x1 - ext * s.dx, s.y1 - ext * s.dy);
+      ctx.lineTo(s.x2 + ext * s.dx, s.y2 + ext * s.dy);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   /* faint example box on the empty sheet — gone at the first stroke */
@@ -1152,11 +1451,36 @@
     return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
   }
 
+  /* Pen beats a simultaneous touch. Artists rest the palm BEFORE the
+     nib lands, so first-pointer-wins hands the whole edge to the palm
+     and the pen draws nothing; pointerId guarding only ever rejected
+     the SECOND contact. A pen pointerdown evicts a touch stroke, and
+     touch is ignored for a moment after any pen event. */
+  var lastPenAt = -1e9;
+  var activeType = '';
+  var PEN_GUARD_MS = 600;
+
+  function penWins(ev) {
+    var now = (typeof ev.timeStamp === 'number') ? ev.timeStamp : Date.now();
+    if (ev.pointerType === 'pen') { lastPenAt = now; return true; }
+    if (ev.pointerType === 'touch' && now - lastPenAt < PEN_GUARD_MS) return false;
+    return true;
+  }
+
   canvas.addEventListener('pointerdown', function (ev) {
-    if (phase !== 'draw' || activePointer !== null) return;
+    if (phase !== 'draw') return;
+    if (!penWins(ev)) return;
+    if (activePointer !== null) {
+      if (!(ev.pointerType === 'pen' && activeType === 'touch')) return;
+      try { canvas.releasePointerCapture(activePointer); } catch (e) {}
+      live = null;                       /* discard what the palm drew */
+    }
     ev.preventDefault();
     activePointer = ev.pointerId;
+    activeType = ev.pointerType || '';
     try { canvas.setPointerCapture(ev.pointerId); } catch (e) {}
+    /* preventDefault kills the focus the tap would have given us */
+    try { canvas.focus({ preventScroll: true }); } catch (e) {}
     live = [pointerPos(ev)];
     draw();
   });
@@ -1164,22 +1488,37 @@
   canvas.addEventListener('pointermove', function (ev) {
     if (ev.pointerId !== activePointer || !live) return;
     ev.preventDefault();
-    live.push(pointerPos(ev));
+    /* a 120Hz pen delivers several positions per dispatched event, and
+       every one of them feeds the line fit */
+    var evs = (typeof ev.getCoalescedEvents === 'function') ? ev.getCoalescedEvents() : null;
+    if (!evs || !evs.length) evs = [ev];
+    for (var i = 0; i < evs.length; i++) live.push(pointerPos(evs[i]));
     draw();
   });
 
-  canvas.addEventListener('pointerup', function (ev) {
+  function onUp(ev) {
     if (ev.pointerId !== activePointer) return;
-    ev.preventDefault();
+    if (ev.cancelable) ev.preventDefault();
     finishStroke();
-  });
+  }
 
-  canvas.addEventListener('pointercancel', function (ev) {
+  function onCancel(ev) {
     if (ev.pointerId !== activePointer) return;
     live = null;
     activePointer = null;
+    activeType = '';
     draw();
-  });
+  }
+
+  canvas.addEventListener('pointerup', onUp);
+  /* Without this, one release off-canvas after a failed setPointerCapture
+     left activePointer set forever and the sheet stopped accepting
+     strokes until "new round". */
+  window.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onCancel);
+  window.addEventListener('pointercancel', onCancel);
+  /* iOS drops capture without ever sending pointerup */
+  canvas.addEventListener('lostpointercapture', onCancel);
 
   /* A stroke is accepted as an EDGE only if it is long enough and
      straight enough. Rejections never cost the player anything — the
@@ -1189,22 +1528,28 @@
   function finishStroke() {
     var seg = live ? fitSegment(live) : null;
     var bend = seg ? strokeBendRMS(live, seg) : 0;
-    if (!seg || seg.len < MIN_STROKE) {
-      if (seg) hint.textContent = 'stroke ignored — an edge wants ' + MIN_STROKE + 'px+ of committed line.';
+    if (!seg || seg.len < minStroke()) {
+      if (seg) hint.textContent = 'too short to read as an edge — pull a longer line.';
     } else if (bend > MAX_BEND * seg.len) {
-      hint.textContent = 'that stroke curves — one straight stroke per edge, not a whole box in one go.';
+      hint.textContent = 'that one curves — one straight stroke per edge, not a whole box in one go.';
     } else if (strokes.length >= MAX_EDGES) {
       hint.textContent = 'that is plenty of edges — check it.';
     } else {
       strokes.push({ pts: live, seg: seg });
-      if (strokes.length === MIN_EDGES) {
-        hint.textContent = '“check it ✓” is live — more edges give the critique more to chew on.';
+      if (strokes.length === 1) {
+        hint.textContent = 'see the dashes past its ends? that is your line extended — the whole trick is watching where it points.';
+      } else if (strokes.length === MIN_EDGES) {
+        hint.textContent = '“check it ✓” is live now — every extra edge gives the read more to work with.';
       } else if (strokes.length >= MAX_EDGES) {
         hint.textContent = 'that is plenty of edges — check it.';
+      } else if (strokes.length < MIN_EDGES) {
+        hint.textContent = (MIN_EDGES - strokes.length) + ' more edge' +
+          (MIN_EDGES - strokes.length === 1 ? '' : 's') + ' and you can check it.';
       }
     }
     live = null;
     activePointer = null;
+    activeType = '';
     updateBar();
     draw();
   }
@@ -1215,13 +1560,15 @@
     phase = 'result';
     var segs = [], i;
     for (i = 0; i < strokes.length; i++) segs.push(strokes[i].seg);
-    result = analyzeBox(segs);
+    /* scoreOpts() is read BEFORE report(), so "has a previous best" is
+       about earlier sessions and not about the score being handed in */
+    result = analyzeBox(segs, scoreOpts());
     renderCritique(result);
     draw();
     var res = ArtDaily.report(result.score);
     hudScore.textContent = String(res.score);
     hudBest.textContent = res.best === null ? '–' : String(res.best);
-    hint.textContent = 'the reveal is in coral — every line extended, each set’s VP. “new round” for the next box.';
+    hint.textContent = 'every line is extended across the sheet. each marked point is a vanishing point — where one set of your edges wants to meet. “new round” for the next box.';
     updateBar();
     showToast((res.isNewBest ? 'new best! ' : 'score ') + res.score + ' / 100', res.isNewBest);
   }
@@ -1234,7 +1581,7 @@
     var i, f, v, row, axis, verdict, score, note;
     for (i = 0; i < r.families.length; i++) {
       f = r.families[i];
-      v = verdictFor(f);
+      v = verdictFor(f, r.tol);
       row = document.createElement('button');
       row.type = 'button';
       row.className = 'crit-row';
@@ -1256,11 +1603,24 @@
       })(i));
       critique.appendChild(row);
     }
-    if (r.notABox) {
-      note = document.createElement('p');
-      note.className = 'crit-row crit-note';
-      note.textContent = 'these three sets cannot belong to one box — no camera sees them together (round caps at ' + NOT_A_BOX + ').';
-      critique.appendChild(note);
+    /* At most one whole-drawing note, and it names the cause the reader
+       can act on. "No camera sees them together" described a pinhole
+       model recovered from the orthocenter of the VP triangle — true,
+       and unreadable by the person it was written for. */
+    note = null;
+    if (r.starved) {
+      note = 'couldn’t sort these into three clean directions — draw the three families more distinctly (a box has edges going left, right and up) and check again. nothing was held against you for it.';
+    } else if (r.notABox) {
+      note = 'these three sets can’t all belong to one box: at least one is spreading where it should be closing. the reveal shows which — that is exactly the thing to fix next.';
+      if (r.wobbly) note += ' your lines are also wobbling a fair bit, so steadiness is the quicker win.';
+    } else if (r.wobbly) {
+      note = 'your lines wobble more than they lean — that is a steadiness thing, not a perspective mistake. draw each edge in one confident pull and the read gets much sharper.';
+    }
+    if (note) {
+      var p = document.createElement('p');
+      p.className = 'crit-row crit-note';
+      p.textContent = note;
+      critique.appendChild(p);
     }
     critique.hidden = false;
   }
@@ -1273,8 +1633,8 @@
       rows[i].classList.toggle('is-lit', i === idx);
     }
     hint.textContent = (idx === -1)
-      ? 'whole reveal — every line extended, each set’s VP. “new round” for the next box.'
-      : 'spotlit: ' + result.families[idx].label + ' — tap the row again for the whole reveal.';
+      ? 'whole reveal — every line extended, and the point each set aims at. “new round” for the next box.'
+      : 'showing just: ' + result.families[idx].label + ' — tap the row again to see all three.';
     draw();
   }
 
@@ -1304,7 +1664,31 @@
   });
 
   ArtDaily.onTheme(draw);
-  window.addEventListener('resize', function () { fitCanvas(); draw(); });
+
+  /* The hardware changed mid-session (a laptop player plugged in a
+     tablet). Every tolerance in the scorer is a function of it, so a
+     reveal already on screen must be re-read rather than left claiming
+     a standard it was not judged by. The score already reported for
+     this round stands — reporting twice would be a lie about how many
+     drills were done. */
+  ArtDaily.onInput(function () {
+    if (phase === 'result' && strokes.length) {
+      var segs = [], i;
+      for (i = 0; i < strokes.length; i++) segs.push(strokes[i].seg);
+      result = analyzeBox(segs, scoreOpts());
+      if (spotlight >= result.families.length) spotlight = -1;
+      renderCritique(result);
+    }
+    draw();
+  });
+
+  window.addEventListener('resize', function () {
+    /* height follows width, so a height-only change (an iOS toolbar
+       collapsing mid-round) must not disturb the box */
+    if (Math.abs(canvas.getBoundingClientRect().width - W) < 4) return;
+    fitCanvas();
+    draw();
+  });
 
   /* ---- boot ---- */
   fitCanvas();

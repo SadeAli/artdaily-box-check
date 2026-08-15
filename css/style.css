@@ -39,7 +39,7 @@
   --hand: 'Caveat', 'Segoe Print', 'Comic Sans MS', cursive;
   --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
 
-  --game-accent: var(--coral);
+  --game-accent: var(--coral); /* TODO: pick this game's accent */
 }
 
 :root[data-theme="dark"] {
@@ -383,6 +383,20 @@ a { color: inherit; }
   }
 }
 
+/* The SDK fills this when it knows the input hardware. Scores are eased
+   per device, so the drill says which device it eased for. */
+.hud-input { min-width: 0; border: 0; background: none; padding: 5px 2px; display: flex; align-items: flex-end; }
+.hud-input dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  max-width: 8.5rem;
+  line-height: 1.25;
+}
+
 /* ============================================================
    game-specific styles below this line
    ============================================================ */
@@ -439,8 +453,28 @@ button.crit-row:focus-visible { outline: 2px solid var(--game-accent); outline-o
 .crit-score { color: var(--muted); font-weight: 700; }
 
 /* the shared .btn has no height floor of its own — give this game's
-   controls a comfortable thumb target */
-.sketchbar .btn, .game-controls .btn { min-height: 44px; }
+   controls a comfortable thumb target, and opt them out of iOS
+   double-tap-to-zoom: "undo" and "new round" get tapped twice in quick
+   succession all round long, and a zoom mid-box strands the sheet */
+.sketchbar .btn, .game-controls .btn {
+  min-height: 44px;
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Tablet/phone defences for the drawing surface. touch-action above
+   stops the scroll; these stop the rest. A slow, deliberate edge —
+   exactly what this drill asks for — is also iOS Safari's long-press
+   gesture, and the callout menu it raises lands on top of the line
+   mid-pull (and then fires pointercancel). Text selection dragging out
+   of the canvas into the hint beside it is the same problem. */
+.game-canvas {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
 
 /* verdict inks, checked against both themes: mixed toward graphite
    on paper for AA, pure watercolor on the night-studio sheet */

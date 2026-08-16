@@ -1163,22 +1163,41 @@
      factor, so a rotated phone (or a dragged desktop window) keeps the
      player's strokes where they put them instead of stranding them off
      the sheet. The fitted lines are rebuilt from the moved points, and
-     any reveal on screen is recomputed from those. */
-  var W = 0, H = 0;
+     any reveal on screen is recomputed from those.
+
+     Two separate reasons to rebuild, and they are NOT the same reason. A
+     WIDTH change moves the drawing and has to rescale it, so a nudge of a
+     pixel or two (a scrollbar arriving, a rounding wobble as an iOS
+     toolbar slides) is deliberately ignored — the box must not be rescaled
+     for nothing. A devicePixelRatio change moves nothing on the sheet but
+     leaves the backing store the wrong size: browser zoom and dragging the
+     window onto a second monitor both do it at an UNCHANGED CSS width, and
+     the old width-only guard returned early on exactly those, so the sheet
+     rendered soft for the rest of the session while every sibling drill
+     re-fitted itself. Returns whether anything moved, so the resize handler
+     measures the box once instead of twice. */
+  var W = 0, H = 0, fitDpr = 0;
   function fitCanvas() {
     var rect = canvas.getBoundingClientRect();
-    var oldW = W;
-    W = Math.max(1, Math.round(rect.width));
-    /* taller sheet on phones: at 0.7 a 330px phone got a 231px drill
-       area, so the box had nowhere to be big — and every angular
-       tolerance in the scorer is a function of how long the edges are */
-    H = Math.round(W * (W < 520 ? 0.85 : 0.7));
+    var w = Math.max(1, Math.round(rect.width));
     var dpr = window.devicePixelRatio || 1;
+    var moved = (W === 0) || Math.abs(w - W) >= 4;
+    if (!moved && dpr === fitDpr) return false;
+    var oldW = W;
+    if (moved) {
+      W = w;
+      /* taller sheet on phones: at 0.7 a 330px phone got a 231px drill
+         area, so the box had nowhere to be big — and every angular
+         tolerance in the scorer is a function of how long the edges are */
+      H = Math.round(W * (W < 520 ? 0.85 : 0.7));
+    }
+    fitDpr = dpr;
     canvas.width = Math.round(W * dpr);
     canvas.height = Math.round(H * dpr);
     canvas.style.height = H + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    if (oldW > 0 && W !== oldW) rescaleStrokes(W / oldW);
+    if (moved && oldW > 0) rescaleStrokes(W / oldW);
+    return true;
   }
 
   function rescaleStrokes(k) {
@@ -1513,6 +1532,24 @@
     return { x: ev.clientX - r.left, y: ev.clientY - r.top };
   }
 
+  /* Sub-pixel repeats are not shape. A hand that presses, sights along the
+     edge and only then pulls emits hundreds of samples from the one spot —
+     a 240Hz pen makes ~100 of them in 0.4s, a 1000Hz one four times that —
+     and fitSegment is an UNWEIGHTED least-squares over the raw list, so
+     every copy is a vote. On a normal 4px-bowed 200px edge that pile drags
+     the fitted angle by ~0.9°, which is an eighth of the whole zero-point
+     span a pen is scored against, always toward the end the hand rested on;
+     and strokeBendRMS divides by the same inflated count, so the curve gate
+     reads a third gentler than the stroke really is. Dropping them costs a
+     FAST stroke nothing — its samples are pixels apart by definition — and
+     it also stops the live repaint walking a point list that grows for as
+     long as the hand is still. */
+  function addSample(pts, p) {
+    var last = pts.length ? pts[pts.length - 1] : null;
+    if (last && Math.abs(p.x - last.x) < 1 && Math.abs(p.y - last.y) < 1) return;
+    pts.push(p);
+  }
+
   /* Pen beats a simultaneous touch. Artists rest the palm BEFORE the
      nib lands, so first-pointer-wins hands the whole edge to the palm
      and the pen draws nothing; pointerId guarding only ever rejected
@@ -1551,11 +1588,11 @@
     if (ev.pointerId !== activePointer || !live) return;
     ev.preventDefault();
     /* a 120Hz pen delivers several positions per dispatched event, and
-       every one of them feeds the line fit */
-    var evs = (typeof ev.getCoalescedEvents === 'function') ? ev.getCoalescedEvents() : null;
-    if (!evs || !evs.length) evs = [ev];
+       every one of them feeds the line fit (ArtDaily.samples is that
+       pattern once, guarded — this drill used to hand-roll it) */
+    var evs = ArtDaily.samples(ev);
     var rect = canvas.getBoundingClientRect();
-    for (var i = 0; i < evs.length; i++) live.push(pointerPos(evs[i], rect));
+    for (var i = 0; i < evs.length; i++) addSample(live, pointerPos(evs[i], rect));
     draw();
   });
 
@@ -1797,16 +1834,15 @@
   });
 
   /* One check per frame, not one per resize event: a dragged desktop
-     window fires these faster than the sheet can be rebuilt. */
+     window fires these faster than the sheet can be rebuilt. fitCanvas
+     decides whether anything actually moved (height follows width, so an
+     iOS toolbar collapsing mid-round is not a resize at all). */
   var resizeRaf = 0;
   window.addEventListener('resize', function () {
     if (resizeRaf) return;
     resizeRaf = requestAnimationFrame(function () {
       resizeRaf = 0;
-      /* height follows width, so a height-only change (an iOS toolbar
-         collapsing mid-round) must not disturb the box */
-      if (Math.abs(canvas.getBoundingClientRect().width - W) < 4) return;
-      fitCanvas();
+      if (!fitCanvas()) return;   /* nothing moved, and nothing was cleared */
       paintNow();   /* fitCanvas already blanked the sheet — no empty frame */
     });
   });

@@ -1644,7 +1644,16 @@
     var seg = live ? fitSegment(live) : null;
     var bend = seg ? strokeBendRMS(live, seg) : 0;
     if (!seg || seg.len < minStroke()) {
-      if (seg) hint.textContent = 'too short to read as an edge — pull a longer line.';
+      /* NEVER A DEAD TAP. fitSegment answers null for a press that never
+         moved — one point is not a line — and that branch used to say
+         nothing at all: the sheet swallowed the press, the edge counter
+         did not move, and the first thing a beginner does on a blank
+         canvas is tap it once to see what happens. Every sibling drill
+         answers a tap in words; this one answered with silence, on the
+         one screen where silence reads as "broken". */
+      hint.textContent = seg
+        ? 'too short to read as an edge — pull a longer line.'
+        : 'that was a tap — press and pull one straight line for one edge.';
     } else if (bend > MAX_BEND * seg.len) {
       hint.textContent = 'that one curves — one straight stroke per edge, not a whole box in one go.';
     } else if (strokes.length >= MAX_EDGES) {
@@ -1654,7 +1663,9 @@
       if (strokes.length === 1) {
         hint.textContent = 'see the dashes past its ends? that is your line extended — the whole trick is watching where it points.';
       } else if (strokes.length === MIN_EDGES) {
-        hint.textContent = '“check it ✓” is live now — every extra edge gives the read more to work with.';
+        /* the button's ✓ is decoration (aria-hidden in the markup), so the
+           sentence that names the button does not read it out either */
+        hint.textContent = '“check it” is live now — every extra edge gives the read more to work with.';
       } else if (strokes.length >= MAX_EDGES) {
         hint.textContent = 'that is plenty of edges — check it.';
       } else if (strokes.length < MIN_EDGES) {

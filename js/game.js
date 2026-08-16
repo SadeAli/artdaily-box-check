@@ -1200,6 +1200,45 @@
     return true;
   }
 
+  /* A RESIZE IS A CHANGE OF SIZE, NOT A CHANGE OF MIND. A reveal on
+     screen used to be re-read from scratch on every resize frame, and
+     the reading is NOT scale-free: convergeTol() sizes both the scoring
+     ramp and the GROUPING tolerance off the median edge length in
+     pixels, so the same strokes sort differently at a different width.
+     Measured on nine wobbled edges scaled by 1.61: "all aimed at one
+     point ✓ tight · 100" became "these cross over each other in the
+     middle · 35", two families swapped converging↔parallel, the round
+     read 99 → 74 and a ghost box appeared out of nowhere — for a
+     drawing the player had not touched, on a score already reported and
+     still standing in the HUD. Worse, renderCritique was never re-run,
+     so the rows on the page went on describing the old reading while
+     the sheet drew the new one, and a row could spotlight a family it
+     no longer named.
+
+     Every pixel the reveal paints is exactly LINEAR in the scale — a
+     uniform scale about the origin maps lines to lines, so the VPs, the
+     centroid, the drawing size and the reprojected ghost all come out
+     exactly k× (verified by execution), while every angle, and so every
+     verdict, spread and score, is untouched. So the banked reading is
+     carried onto the new sheet instead of being second-guessed. It also
+     takes a 5–14ms grouping pass (desktop; several times that on a
+     phone) off every single frame of a window drag. */
+  function scaleResult(r, k) {
+    var i, f, e;
+    if (!r || !(k > 0) || !isFinite(k)) return;
+    r.cx *= k; r.cy *= k; r.size *= k; r.medLen *= k;
+    for (i = 0; i < r.families.length; i++) {
+      f = r.families[i];
+      if (f.vp) { f.vp = { x: f.vp.x * k, y: f.vp.y * k }; }
+    }
+    if (r.ghost) {
+      for (i = 0; i < r.ghost.length; i++) {
+        e = r.ghost[i];
+        e.x1 *= k; e.y1 *= k; e.x2 *= k; e.y2 *= k;
+      }
+    }
+  }
+
   function rescaleStrokes(k) {
     var i, j, pts;
     for (i = 0; i < strokes.length; i++) {
@@ -1207,14 +1246,26 @@
       for (j = 0; j < pts.length; j++) { pts[j].x *= k; pts[j].y *= k; }
       strokes[i].seg = fitSegment(pts);
     }
-    /* drop any stroke the rescale made degenerate, then re-read the box */
-    for (i = strokes.length - 1; i >= 0; i--) if (!strokes[i].seg) strokes.splice(i, 1);
+    /* drop any stroke the rescale made degenerate. fitSegment only
+       answers null for a one-point list and scaling cannot shorten one,
+       so this has no work to do — but if it ever did, the families' own
+       stroke INDICES would shift under the reveal, and then only a
+       re-read can be trusted. */
+    var dropped = false;
+    for (i = strokes.length - 1; i >= 0; i--) {
+      if (!strokes[i].seg) { strokes.splice(i, 1); dropped = true; }
+    }
     if (live) for (j = 0; j < live.length; j++) { live[j].x *= k; live[j].y *= k; }
-    if (phase === 'result' && strokes.length) {
-      var segs = [];
-      for (i = 0; i < strokes.length; i++) segs.push(strokes[i].seg);
-      result = analyzeBox(segs, scoreOpts());
-      if (spotlight >= result.families.length) spotlight = -1;
+    if (phase === 'result') {
+      if (dropped && strokes.length) {
+        var segs = [];
+        for (i = 0; i < strokes.length; i++) segs.push(strokes[i].seg);
+        result = analyzeBox(segs, scoreOpts());
+        spotlight = -1;
+        renderCritique(result);
+      } else {
+        scaleResult(result, k);
+      }
     }
     updateBar();
   }
